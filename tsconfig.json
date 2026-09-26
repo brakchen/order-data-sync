@@ -1,6 +1,14 @@
 {
-  "extends": "./.wxt/tsconfig.json",
   "compilerOptions": {
-    "types": ["vitest/globals", "@testing-library/jest-dom"]
-  }
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"],
+    "types": ["chrome"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "entrypoints/**/*.ts", "entrypoints/**/*.tsx"]
 }
