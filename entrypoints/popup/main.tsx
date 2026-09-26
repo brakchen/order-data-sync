@@ -166,11 +166,11 @@ function Popup() {
         <div className="section-title"><h2>同步进度</h2><span className="caption">本机保存断点</span></div>
         <div className="sync-actions">
           <button disabled={busy || !readyToSync} onClick={() => void sync(false)}>立即同步</button>
+          <button className="secondary" disabled={busy || !state}
+            onClick={exportLogs}>导出日志（{state?.runtimeLogs.length ?? 0}）</button>
           {hasFailures ? <button className="secondary" disabled={busy || !readyToSync}
             onClick={() => void sync(true)}>重试失败项</button> : null}
         </div>
-        <button className="secondary log-button" disabled={busy || !state}
-          onClick={exportLogs}>导出运行日志（{state?.runtimeLogs.length ?? 0}）</button>
         <div className="domain-list">
           {(['orders', 'logistics', 'statements'] as const).map((domain) => {
             const row = state?.orderProgress.domains[domain];
