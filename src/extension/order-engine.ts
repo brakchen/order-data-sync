@@ -1008,7 +1008,7 @@ async function fetchLogisticsRowsForRound(
 /** 拉一页订单列表，返回 (orderId, 原始行)。 */
 async function fetchOrderListRows(
   state: OrderSyncState,
-  domain: 'orders' | 'logistics' = 'orders',
+  domain: 'orders' | 'logistics' | 'order_details' | 'order_history' = 'orders',
   options: OrderListFetchOptions = {},
 ): Promise<OrderListFetchResult> {
   const boundTab = state.boundTab!;
@@ -2182,6 +2182,8 @@ async function processOrderDetailsBatch(
         }
         const uploadStartedAt = Date.now();
         try {
+          // domain 使用 'orders'：后端 tts-erp 的 OrderSyncDumpRequestSchema 当前不支持
+          // 'order_details' 域值，订单详情归入 'orders' 域上传，后端通过 endpoint 路径区分。
           await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
             domain: 'orders',
             endpoint: detailUrl,
@@ -2510,6 +2512,8 @@ async function processOrderHistoryBatch(
         }
         const uploadStartedAt = Date.now();
         try {
+          // domain 使用 'orders'：后端 tts-erp 的 OrderSyncDumpRequestSchema 当前不支持
+          // 'order_history' 域值，订单历史归入 'orders' 域上传，后端通过 endpoint 路径区分。
           await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
             domain: 'orders',
             endpoint: historyUrl,
@@ -2986,6 +2990,8 @@ export async function handleOrderSyncAlarm(trigger: OrderSyncTrigger = 'automati
   try {
     await beginOrderDomainRun('orders', trigger);
     await beginOrderDomainRun('logistics', trigger);
+    await beginOrderDomainRun('order_details', trigger);
+    await beginOrderDomainRun('order_history', trigger);
     await recordOrderSyncRuntimeLog('orders', 'alarm_started', 'started', '订单主动轮询开始。', { trigger });
     const pagePipelineUsed = await handleOrderSyncAlarmOnce();
     const current = await getOrderSyncState();
@@ -3676,7 +3682,7 @@ export async function requestManualOrderDomainSync(retryFailedOnly: boolean): Pr
   if (!current.boundTab?.sellerId || !current.settings.syncToken.trim() || !isOrderDomainSyncEnabled(current.settings)) {
     throw new Error('请先绑定店铺并完成订单同步配置。');
   }
-  const running = (['orders', 'logistics', 'statements'] as const).filter((domain) =>
+  const running = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const).filter((domain) =>
     current.orderProgress?.domains[domain]?.syncRunStatus === 'running',
   );
   if (running.some((domain) => !orderDomainIsStuck(current.orderProgress?.domains[domain]))) {
@@ -3741,7 +3747,7 @@ export async function stopStuckOrderDomainAndRetry(domain: OrderDomainKey): Prom
       });
     });
     if (oldRunId) stoppedOrderRunIds.add(oldRunId);
-    const mainAlarm = domain === 'orders' ? ORDER_SYNC_ALARM : domain === 'logistics' ? LOGISTICS_SYNC_ALARM : SETTLEMENT_SYNC_ALARM;
+    const mainAlarm = domain === 'orders' ? ORDER_SYNC_ALARM : domain === 'logistics' ? LOGISTICS_SYNC_ALARM : domain === 'order_details' ? ORDER_DETAILS_SYNC_ALARM : domain === 'order_history' ? ORDER_HISTORY_SYNC_ALARM : SETTLEMENT_SYNC_ALARM;
     if (typeof chrome.alarms.clear === 'function') {
       await chrome.alarms.clear(mainAlarm);
       await chrome.alarms.clear(continuationAlarmForOrderDomain(domain));
@@ -3781,6 +3787,9 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
     if (domain === 'logistics') {
       logisticsSelection = await fetchLogisticsRowsForRound(state, settings, scope);
       orderRows = logisticsSelection?.rows ?? (await fetchOrderListRows(state, 'logistics')).rows;
+    }
+    if (domain === 'order_details' || domain === 'order_history') {
+      orderRows = (await fetchOrderListRows(state, domain)).rows;
     }
   } catch (error) {
     if (error instanceof StopOrderDomainBatch) {
@@ -4112,8 +4121,9 @@ export async function runInitialOrderDomainSync(
       await pollOrderDomain('order_history');
     }
     const current = await getOrderSyncState();
-    const pendingDomains = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const)
+    const pendingDomains = (['orders', 'logistics', 'statements'] as const)
       .filter((domain) => !isOrderDomainRoundSettled(current.orderProgress?.domains[domain]));
+    // order_details 和 order_history 由 pipeline 自动入队，不在首次同步的 pending 域列表中报告。
     await recordOrderSyncRuntimeLog(
       'all',
       pendingDomains.length === 0 ? 'initial_sync_completed' : 'initial_sync_queued',
