@@ -2201,10 +2201,8 @@ async function processOrderDetailsBatch(
         }
         const uploadStartedAt = Date.now();
         try {
-          // domain 使用 'orders'：后端 tts-erp 的 OrderSyncDumpRequestSchema 当前不支持
-          // 'order_details' 域值，订单详情归入 'orders' 域上传，后端通过 endpoint 路径区分。
           await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
-            domain: 'orders',
+            domain: 'order_details',
             endpoint: detailUrl,
             method: 'POST',
             request: { body: detailBody },
@@ -2547,10 +2545,8 @@ async function processOrderHistoryBatch(
         }
         const uploadStartedAt = Date.now();
         try {
-          // domain 使用 'orders'：后端 tts-erp 的 OrderSyncDumpRequestSchema 当前不支持
-          // 'order_history' 域值，订单历史归入 'orders' 域上传，后端通过 endpoint 路径区分。
           await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
-            domain: 'orders',
+            domain: 'order_history',
             endpoint: historyUrl,
             method: 'GET',
             request: {},

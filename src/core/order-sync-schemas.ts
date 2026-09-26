@@ -19,7 +19,7 @@ export const HasDataRequestSchema = z.object({
     sellerId: z.string().min(1).max(128),
     shopId: z.string().min(1).max(128),
   }),
-  domain: z.enum(['orders', 'logistics', 'statements', 'after_sales']),
+  domain: z.enum(['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history']),
   ids: z.array(z.string().min(1)).min(1).max(500),
   // 结算域的唯一键还包含 statement_version；缺省表示兼容旧客户端的 ID-only 语义。
   versions: z.record(
@@ -34,7 +34,7 @@ export const HasDataResponseSchema = z.object({
   code: z.number(),
   requestId: z.string().optional(),
   data: z.object({
-    domain: z.enum(['orders', 'logistics', 'statements', 'after_sales']),
+    domain: z.enum(['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history']),
     covered: z.record(z.string(), z.boolean()),
   }),
 });
@@ -51,7 +51,7 @@ export const OrderSyncDumpRequestSchema = z.object({
     shopId: z.string().min(1).max(128),
   }),
   dump: z.object({
-    domain: z.enum(['orders', 'logistics', 'statements', 'after_sales']),
+    domain: z.enum(['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history']),
     mainOrderId: z.string().max(128).optional(),
     statementId: z.string().max(128).optional(),
     statementVersion: z.number().int().optional(),
@@ -175,5 +175,5 @@ export type OrderSyncReconcileResponse = z.infer<typeof OrderSyncReconcileRespon
 
 // ─── Domain enum ────────────────────────────────────────────────────
 
-export const ORDER_SYNC_DOMAINS = ['orders', 'logistics', 'statements', 'after_sales'] as const;
+export const ORDER_SYNC_DOMAINS = ['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history'] as const;
 export type OrderSyncDomain = (typeof ORDER_SYNC_DOMAINS)[number];
