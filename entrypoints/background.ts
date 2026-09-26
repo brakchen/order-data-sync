@@ -374,13 +374,15 @@ async function findAutomaticSellerTab(): Promise<chrome.tabs.Tab | null> {
   return tabs
     .filter((tab) => tab.id !== undefined && tab.url && isSellerCenterUrl(tab.url)
       && !isTikTokLoginPage(tab.url))
-    .sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active))
+    .sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned))
+      || Number(Boolean(right.active)) - Number(Boolean(left.active))
       || (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0] ?? null;
 }
 
 async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<void> {
   const tabId = candidate.id!;
   const tabUrl = candidate.url!;
+  const candidateWasPinned = candidate.pinned === true;
   await mutateOrderSyncState((current) => {
     if (current.sellerBinding.mode !== 'auto' || current.boundTab) {
       throw new Error('自动绑定状态已结束。');
@@ -395,12 +397,13 @@ async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<voi
       },
     };
   });
-  await pinSellerTab(tabId, 'auto_bind');
+  if (!candidateWasPinned) await pinSellerTab(tabId, 'auto_bind');
   await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_requested', 'started', '已自动绑定可用的 Seller Center 页面，不刷新当前页面，等待接口请求捕获 Seller ID。', {
     stage: 'seller_binding',
     tabId,
     pageOrigin: new URL(tabUrl).origin,
     reloadRequested: false,
+    reusedPinnedTab: candidateWasPinned,
   });
   await ensureBoundAlarms('configuration_ready');
 }
