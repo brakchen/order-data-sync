@@ -4,7 +4,8 @@ body { margin: 0; width: 380px; min-height: 500px; }
 button, input { font: inherit; }
 .shell { display: grid; gap: 12px; padding: 16px; }
 .header { display: flex; align-items: center; gap: 11px; padding: 3px 2px 8px; }
-.mark { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 12px; color: white; background: #176b59; font-weight: 800; letter-spacing: -.05em; }
+.mark { display: grid; width: 38px; height: 38px; place-items: center; overflow: hidden; border-radius: 12px; background: #176b59; }
+.mark img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .eyebrow { margin: 0 0 2px; color: #718078; font-size: 9px; font-weight: 800; letter-spacing: .14em; }
 h1 { margin: 0; font-size: 17px; }
 .card { padding: 14px; border: 1px solid #e2e7e5; border-radius: 13px; background: #fff; box-shadow: 0 3px 12px #22332c08; }

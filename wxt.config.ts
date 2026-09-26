@@ -3,8 +3,14 @@ import { defineConfig } from 'wxt';
 export default defineConfig({
   manifest: {
     name: 'TikTok Shop Order Data Sync',
-    version: '0.1.9',
+    version: '0.1.10',
     description: '独立同步 TikTok Shop 订单、物流与结算数据。',
+    icons: {
+      16: '/icons/icon-16.png',
+      32: '/icons/icon-32.png',
+      48: '/icons/icon-48.png',
+      128: '/icons/icon-128.png',
+    },
     permissions: ['alarms', 'storage', 'tabs', 'scripting', 'unlimitedStorage'],
     host_permissions: [
       'https://seller.tiktokglobalshop.com/*',

@@ -123,7 +123,7 @@ function Popup() {
   return (
     <main className="shell">
       <header className="header">
-        <div className="mark">OS</div>
+        <div className="mark"><img src="/icons/icon-128.png" alt="" /></div>
         <div><p className="eyebrow">TIKTOK SHOP</p><h1>订单数据同步</h1></div>
       </header>
 
