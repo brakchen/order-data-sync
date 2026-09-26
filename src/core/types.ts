@@ -1,5 +1,5 @@
 /** Domain-owned state for the standalone order extension. */
-export type OrderDomainKey = 'orders' | 'logistics' | 'statements';
+export type OrderDomainKey = 'orders' | 'logistics' | 'statements' | 'order_details' | 'order_history';
 export type OrderSyncTrigger = 'automatic' | 'manual';
 export type OrderDomainRunStatus = 'idle' | 'running' | 'done' | 'partial_failed' | 'interrupted';
 export type OrderDomainListPhase = 'idle' | 'list_fetching' | 'processing';

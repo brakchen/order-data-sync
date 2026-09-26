@@ -9,7 +9,7 @@ import {
   type OrderSyncScope,
   type OrderSyncSettings as OrderApiSettings,
 } from '../core/order-sync';
-import { createLogisticDetailQuery, createOrderListRequestBody, tiktokOrderEndpointUrl } from '../core/tiktok-order-endpoints';
+import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryQuery, createOrderListRequestBody, tiktokOrderEndpointUrl } from '../core/tiktok-order-endpoints';
 import { isCancelledTikTokOrderRow } from '../core/tiktok-order-status';
 import {
   createStatementListQuery,
@@ -49,9 +49,13 @@ export const ORDER_SYNC_ALARMS = {
   orders: 'order-data-sync:orders',
   logistics: 'order-data-sync:logistics',
   statements: 'order-data-sync:statements',
+  order_details: 'order-data-sync:order-details',
+  order_history: 'order-data-sync:order-history',
   ordersContinue: 'order-data-sync:orders:continue',
   logisticsContinue: 'order-data-sync:logistics:continue',
   statementsContinue: 'order-data-sync:statements:continue',
+  orderDetailsContinue: 'order-data-sync:order-details:continue',
+  orderHistoryContinue: 'order-data-sync:order-history:continue',
 } as const;
 const TIKTOK_SELLER_CENTER_ORIGINS = [
   'https://seller.tiktokglobalshop.com',
@@ -116,7 +120,9 @@ async function clearOrderBinding(
       || current.settings.syncToken.trim() !== expectedState.settings.syncToken.trim()) return false;
     await saveOrderSyncState({ ...current, boundTab: null, shopRegion: null });
     for (const name of [ORDER_SYNC_ALARM, ORDER_CONTINUATION_ALARM, LOGISTICS_SYNC_ALARM,
-      LOGISTICS_CONTINUATION_ALARM, SETTLEMENT_SYNC_ALARM, SETTLEMENT_CONTINUATION_ALARM]) {
+      LOGISTICS_CONTINUATION_ALARM, SETTLEMENT_SYNC_ALARM, SETTLEMENT_CONTINUATION_ALARM,
+      ORDER_DETAILS_SYNC_ALARM, ORDER_DETAILS_CONTINUATION_ALARM,
+      ORDER_HISTORY_SYNC_ALARM, ORDER_HISTORY_CONTINUATION_ALARM]) {
       await chrome.alarms.clear(name);
     }
     return true;
@@ -162,6 +168,18 @@ const SETTLEMENT_SYNC_NEXT_DELAY_MINUTES = 24 * 60;
 const ORDER_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.ordersContinue;
 
 const SETTLEMENT_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.statementsContinue;
+
+const ORDER_DETAILS_SYNC_ALARM = ORDER_SYNC_ALARMS.order_details;
+
+const ORDER_DETAILS_SYNC_NEXT_DELAY_MINUTES = 24 * 60;
+
+const ORDER_DETAILS_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.orderDetailsContinue;
+
+const ORDER_HISTORY_SYNC_ALARM = ORDER_SYNC_ALARMS.order_history;
+
+const ORDER_HISTORY_SYNC_NEXT_DELAY_MINUTES = 24 * 60;
+
+const ORDER_HISTORY_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.orderHistoryContinue;
 
 const ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES = 0.1;
 
@@ -1244,6 +1262,8 @@ class StopOrderDomainBatch extends Error {
 function continuationAlarmForOrderDomain(domain: OrderPollingDomain): string {
   if (domain === 'orders') return ORDER_CONTINUATION_ALARM;
   if (domain === 'logistics') return LOGISTICS_CONTINUATION_ALARM;
+  if (domain === 'order_details') return ORDER_DETAILS_CONTINUATION_ALARM;
+  if (domain === 'order_history') return ORDER_HISTORY_CONTINUATION_ALARM;
   return SETTLEMENT_CONTINUATION_ALARM;
 }
 
@@ -1263,6 +1283,8 @@ async function deferOrderDomainAlarm(domain: OrderPollingDomain): Promise<void> 
 function cycleDelayForOrderDomain(domain: OrderPollingDomain): number {
   if (domain === 'orders') return ORDER_SYNC_NEXT_DELAY_MINUTES;
   if (domain === 'logistics') return LOGISTICS_SYNC_NEXT_DELAY_MINUTES;
+  if (domain === 'order_details') return ORDER_DETAILS_SYNC_NEXT_DELAY_MINUTES;
+  if (domain === 'order_history') return ORDER_HISTORY_SYNC_NEXT_DELAY_MINUTES;
   return SETTLEMENT_SYNC_NEXT_DELAY_MINUTES;
 }
 
@@ -1310,6 +1332,14 @@ async function scheduleNextOrderDomainRound(domain: OrderPollingDomain): Promise
     await chrome.alarms.create(LOGISTICS_SYNC_ALARM, {
       delayInMinutes: cycleDelayForOrderDomain(domain),
     });
+  } else if (domain === 'order_details') {
+    await chrome.alarms.create(ORDER_DETAILS_SYNC_ALARM, {
+      delayInMinutes: cycleDelayForOrderDomain(domain),
+    });
+  } else if (domain === 'order_history') {
+    await chrome.alarms.create(ORDER_HISTORY_SYNC_ALARM, {
+      delayInMinutes: cycleDelayForOrderDomain(domain),
+    });
   } else {
     await chrome.alarms.create(SETTLEMENT_SYNC_ALARM, {
       delayInMinutes: cycleDelayForOrderDomain(domain),
@@ -1341,6 +1371,14 @@ async function scheduleOrderDomainContinuation(
   }
   if (domain === 'orders') {
     await chrome.alarms.create(ORDER_CONTINUATION_ALARM, {
+      delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES,
+    });
+  } else if (domain === 'order_details') {
+    await chrome.alarms.create(ORDER_DETAILS_CONTINUATION_ALARM, {
+      delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES,
+    });
+  } else if (domain === 'order_history') {
+    await chrome.alarms.create(ORDER_HISTORY_CONTINUATION_ALARM, {
       delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES,
     });
   } else {
@@ -1943,6 +1981,659 @@ async function processLogisticsBatch(
 }
 
 
+/**
+ * 订单详情（order/get）逐单请求并上传。结构与物流批次相同（N+1 模式）。
+ * 每轮最多处理 LOGISTICS_BATCH_SIZE 单，游标持久化，下一轮从未完成位置继续。
+ */
+async function processOrderDetailsBatch(
+  state: OrderSyncState,
+  settings: OrderApiSettings,
+  scope: OrderSyncScope,
+  boundTab: NonNullable<OrderSyncState['boundTab']>,
+  origin: string,
+  rows: Array<{ orderId: string; row: Record<string, unknown>; status: number }>,
+  terminalSkipped = 0,
+  options: LogisticsBatchOptions = {},
+): Promise<void> {
+  const previous = state.orderProgress?.domains.order_details ?? createDefaultOrderProgress().domains.order_details;
+  const activeRows = rows.filter((entry) => !isCancelledTikTokOrderRow(entry.row));
+  const cancelledSkipped = rows.length - activeRows.length;
+  const pendingKeys = pendingOrderDomainKeys(previous, activeRows.map((entry) => ({ key: entry.orderId })));
+  const entryById = new Map(activeRows.map((entry) => [entry.orderId, entry]));
+  const preservedFailedIds = new Set(options.preservedFailedOrderIds ?? []);
+  const failedIds = new Set([
+    ...(previous.failedOrderIds ?? []).filter((key) => pendingKeys.includes(key)),
+    ...preservedFailedIds,
+  ]);
+  let lastError = previous.lastError;
+  const terminalCount = Math.max(0, terminalSkipped) + cancelledSkipped;
+  const roundTotal = activeRows.length + terminalCount;
+  const progressTotal = Math.max(roundTotal, options.total ?? roundTotal);
+  const uploadedBefore = Math.max(0, options.uploadedBefore ?? 0);
+  const pendingAfterPage = Math.max(0, options.pendingAfterPage ?? 0);
+  const pagePending = () => pendingAfterPage + new Set([...preservedFailedIds, ...pendingKeys]).size;
+  let uploaded = uploadedBefore + terminalCount + Math.max(0, activeRows.length - pendingKeys.length);
+  const batch = pendingKeys.slice(0, LOGISTICS_BATCH_SIZE)
+    .map((orderId) => entryById.get(orderId))
+    .filter((entry): entry is (typeof rows)[number] => entry !== undefined);
+  const pendingSnapshot = () => [...new Set([...preservedFailedIds, ...pendingKeys])];
+  const failedSnapshot = () => [...failedIds];
+  const resumeOrderId = () => pendingKeys[0] ?? null;
+
+  if (batch.length === 0) {
+    await recordOrderProgress('order_details', {
+      total: progressTotal,
+      uploaded,
+      pending: pagePending(),
+      failed: failedSnapshot().length,
+      currentOrderId: null,
+      currentOrderIndex: null,
+      resumeOrderId: resumeOrderId(),
+      failedOrderIds: failedSnapshot(),
+      snapshotKeys: rows.map((entry) => entry.orderId),
+      pendingOrderIds: pendingSnapshot(),
+      lastError: pagePending() > 0 ? lastError : null,
+      ...resetOrderListProgress(),
+    }, pendingKeys.length > 0 ? 'running' : 'ok', state,
+    pendingKeys.length > 0 ? '订单详情批次等待订单重试。' : '订单详情本轮已完成。', {
+      action: pendingKeys.length > 0 ? 'batch_waiting_retry' : 'batch_completed',
+      batchSize: 0,
+    });
+    return;
+  }
+
+  await recordOrderProgress('order_details', {
+    total: progressTotal,
+    uploaded,
+    pending: pagePending(),
+    failed: failedSnapshot().length,
+    currentOrderId: null,
+    currentOrderIndex: null,
+    resumeOrderId: resumeOrderId(),
+    failedOrderIds: failedSnapshot(),
+    snapshotKeys: rows.map((entry) => entry.orderId),
+    pendingOrderIds: pendingSnapshot(),
+    lastError,
+    listPhase: 'processing',
+  }, 'running', state, `订单详情批次开始：本轮处理 ${batch.length} 单。`, {
+    action: 'batch_started',
+    batchSize: batch.length,
+    resumeOrderId: resumeOrderId(),
+  });
+
+  let stopped = false;
+  for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+    const pendingRow = batch[batchIndex]!;
+    const orderId = pendingRow.orderId;
+    const orderIndex = rows.findIndex((entry) => entry.orderId === orderId);
+    await recordOrderProgress('order_details', {
+      total: progressTotal,
+      uploaded,
+      pending: pagePending(),
+      failed: failedSnapshot().length,
+      currentOrderId: orderId,
+      currentOrderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+      resumeOrderId: resumeOrderId(),
+      failedOrderIds: failedSnapshot(),
+      pendingOrderIds: pendingSnapshot(),
+      lastError,
+    }, 'running', state, `订单详情开始处理：${orderId}`, {
+      action: 'order_started',
+      orderId,
+      orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+      batchIndex: batchIndex + 1,
+      batchSize: batch.length,
+    });
+
+    let attemptError: string | null = null;
+    try {
+      if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_details', state)) {
+        stopped = true;
+        break;
+      }
+      const detailUrl = tiktokOrderEndpointUrl(origin, 'order-get', { sellerId: boundTab.sellerId! });
+      const detailBody = createOrderGetRequestBody([orderId]);
+      const requestStartedAt = Date.now();
+      let detail: BoundTikTokResponse;
+      try {
+        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, detailUrl, detailBody, 'POST');
+      } catch (error) {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情请求异常。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody),
+          ...orderRequestExceptionDetails(error),
+        });
+        throw error;
+      }
+      const detailPayload = isRecord(detail.payload) ? detail.payload : null;
+      const detailBusinessFailure = detailPayload === null
+        ? null
+        : tiktokBusinessFailure(detailPayload, '订单详情');
+      if (!detail.ok) {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情响应失败。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        if (isTikTokAuthenticationFailure(detail)) {
+          await clearOrderBinding(state, 'order_detail_authentication_failed');
+          stopped = true;
+        }
+        attemptError = orderTikTokFailureSummary('订单详情请求失败', detail);
+      } else if (isTikTokAuthenticationFailure(detail)) {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情响应要求重新登录。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          failureReason: 'authentication_required',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        await clearOrderBinding(state, 'order_detail_authentication_failed');
+        stopped = true;
+        attemptError = '订单详情请求需要重新登录。';
+      } else if (detailPayload === null) {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情响应为空。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          failureReason: 'empty_payload',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        attemptError = `订单详情响应为空（${nullPayloadDiagnostic(detail)}）`;
+      } else if (detailBusinessFailure !== null) {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情业务响应失败。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          failureReason: 'business_code',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        attemptError = detailBusinessFailure;
+      } else {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'succeeded', '订单详情响应已解析。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_details', state)) {
+          stopped = true;
+          break;
+        }
+        const uploadStartedAt = Date.now();
+        try {
+          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+            domain: 'orders',
+            endpoint: detailUrl,
+            method: 'POST',
+            request: { body: detailBody },
+            response: { status: detail.status, body: detailPayload },
+            createdAt: new Date().toISOString(),
+            mainOrderId: orderId,
+          }));
+          await recordOrderSyncRuntimeLog('order_details', 'erp_upload', 'succeeded', '订单详情已写入 ERP。', {
+            stage: 'tts_erp_upload',
+            orderId,
+            endpoint: orderTikTokEndpointPath(detailUrl),
+            durationMs: Math.max(0, Date.now() - uploadStartedAt),
+          });
+        } catch (error) {
+          await recordOrderSyncRuntimeLog('order_details', 'erp_upload', 'failed', '订单详情写入 ERP 失败。', {
+            stage: 'tts_erp_upload',
+            orderId,
+            endpoint: orderTikTokEndpointPath(detailUrl),
+            durationMs: Math.max(0, Date.now() - uploadStartedAt),
+            ...orderRequestExceptionDetails(error),
+          });
+          throw error;
+        }
+      }
+    } catch (error) {
+      attemptError = error instanceof Error ? error.message : String(error);
+    }
+
+    if (attemptError !== null) {
+      failedIds.add(orderId);
+      lastError = attemptError;
+      const pendingIndex = pendingKeys.indexOf(orderId);
+      if (pendingIndex >= 0) {
+        pendingKeys.splice(pendingIndex, 1);
+        pendingKeys.push(orderId);
+      } else {
+        pendingKeys.push(orderId);
+      }
+      await recordOrderProgress('order_details', {
+        total: progressTotal,
+        uploaded,
+        pending: pagePending(),
+        failed: failedSnapshot().length,
+        currentOrderId: null,
+        currentOrderIndex: null,
+        resumeOrderId: resumeOrderId(),
+        failedOrderIds: failedSnapshot(),
+        pendingOrderIds: pendingSnapshot(),
+        lastFailedOrderId: orderId,
+        lastError,
+      }, 'running', state, `订单详情失败：${orderId}（${attemptError}）`, {
+        action: 'order_failed',
+        orderId,
+        orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+        error: sanitizeDiagnosticText(attemptError).slice(0, 240),
+      });
+    } else {
+      const pendingIndex = pendingKeys.indexOf(orderId);
+      if (pendingIndex >= 0) pendingKeys.splice(pendingIndex, 1);
+      uploaded = uploadedBefore + terminalCount + Math.max(0, activeRows.length - pendingKeys.length);
+      preservedFailedIds.delete(orderId);
+      failedIds.delete(orderId);
+      lastError = failedIds.size > 0 ? lastError : null;
+      await recordOrderProgress('order_details', {
+        total: progressTotal,
+        uploaded,
+        pending: pagePending(),
+        failed: failedSnapshot().length,
+        currentOrderId: null,
+        currentOrderIndex: null,
+        resumeOrderId: resumeOrderId(),
+        failedOrderIds: failedSnapshot(),
+        pendingOrderIds: pendingSnapshot(),
+        lastSuccessAt: new Date().toISOString(),
+        lastError,
+      }, 'running', state, `订单详情同步成功：${orderId}`, {
+        action: 'order_succeeded',
+        orderId,
+        orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+      });
+    }
+
+    if (!stopped && batchIndex < batch.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, ORDER_DETAIL_FETCH_DELAY_MS));
+    }
+    if (stopped) break;
+  }
+
+  const completed = !stopped && pendingKeys.length === 0 && failedIds.size === 0 && pendingAfterPage === 0;
+  await recordOrderProgress('order_details', {
+    total: progressTotal,
+    uploaded,
+    pending: pagePending(),
+    failed: failedSnapshot().length,
+    currentOrderId: null,
+    currentOrderIndex: null,
+    resumeOrderId: resumeOrderId(),
+    failedOrderIds: failedSnapshot(),
+    pendingOrderIds: pendingSnapshot(),
+    lastError: pagePending() > 0 ? lastError : null,
+    ...resetOrderListProgress(),
+  }, completed ? 'ok' : 'running', state,
+  completed
+    ? '订单详情批次完成：本轮全部订单已同步。'
+    : `订单详情批次完成：成功 ${uploaded} 单，待处理 ${pagePending()} 单。`, {
+    action: completed ? 'batch_completed' : 'batch_checkpointed',
+    batchSize: batch.length,
+    uploaded,
+    failed: failedSnapshot().length,
+    resumeOrderId: resumeOrderId(),
+  });
+  if (options.scheduleContinuation === false) return;
+  if (completed) {
+    if (typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(ORDER_DETAILS_CONTINUATION_ALARM);
+  } else if (!stopped) {
+    await chrome.alarms.create(ORDER_DETAILS_CONTINUATION_ALARM, {
+      delayInMinutes: LOGISTICS_CONTINUATION_DELAY_MINUTES,
+    });
+  }
+}
+
+
+/**
+ * 订单历史（order/history）逐单请求并上传。结构与订单详情批次相同（N+1 模式）。
+ */
+async function processOrderHistoryBatch(
+  state: OrderSyncState,
+  settings: OrderApiSettings,
+  scope: OrderSyncScope,
+  boundTab: NonNullable<OrderSyncState['boundTab']>,
+  origin: string,
+  rows: Array<{ orderId: string; row: Record<string, unknown>; status: number }>,
+  terminalSkipped = 0,
+  options: LogisticsBatchOptions = {},
+): Promise<void> {
+  const previous = state.orderProgress?.domains.order_history ?? createDefaultOrderProgress().domains.order_history;
+  const activeRows = rows.filter((entry) => !isCancelledTikTokOrderRow(entry.row));
+  const cancelledSkipped = rows.length - activeRows.length;
+  const pendingKeys = pendingOrderDomainKeys(previous, activeRows.map((entry) => ({ key: entry.orderId })));
+  const entryById = new Map(activeRows.map((entry) => [entry.orderId, entry]));
+  const preservedFailedIds = new Set(options.preservedFailedOrderIds ?? []);
+  const failedIds = new Set([
+    ...(previous.failedOrderIds ?? []).filter((key) => pendingKeys.includes(key)),
+    ...preservedFailedIds,
+  ]);
+  let lastError = previous.lastError;
+  const terminalCount = Math.max(0, terminalSkipped) + cancelledSkipped;
+  const roundTotal = activeRows.length + terminalCount;
+  const progressTotal = Math.max(roundTotal, options.total ?? roundTotal);
+  const uploadedBefore = Math.max(0, options.uploadedBefore ?? 0);
+  const pendingAfterPage = Math.max(0, options.pendingAfterPage ?? 0);
+  const pagePending = () => pendingAfterPage + new Set([...preservedFailedIds, ...pendingKeys]).size;
+  let uploaded = uploadedBefore + terminalCount + Math.max(0, activeRows.length - pendingKeys.length);
+  const batch = pendingKeys.slice(0, LOGISTICS_BATCH_SIZE)
+    .map((orderId) => entryById.get(orderId))
+    .filter((entry): entry is (typeof rows)[number] => entry !== undefined);
+  const pendingSnapshot = () => [...new Set([...preservedFailedIds, ...pendingKeys])];
+  const failedSnapshot = () => [...failedIds];
+  const resumeOrderId = () => pendingKeys[0] ?? null;
+
+  if (batch.length === 0) {
+    await recordOrderProgress('order_history', {
+      total: progressTotal,
+      uploaded,
+      pending: pagePending(),
+      failed: failedSnapshot().length,
+      currentOrderId: null,
+      currentOrderIndex: null,
+      resumeOrderId: resumeOrderId(),
+      failedOrderIds: failedSnapshot(),
+      snapshotKeys: rows.map((entry) => entry.orderId),
+      pendingOrderIds: pendingSnapshot(),
+      lastError: pagePending() > 0 ? lastError : null,
+      ...resetOrderListProgress(),
+    }, pendingKeys.length > 0 ? 'running' : 'ok', state,
+    pendingKeys.length > 0 ? '订单历史批次等待订单重试。' : '订单历史本轮已完成。', {
+      action: pendingKeys.length > 0 ? 'batch_waiting_retry' : 'batch_completed',
+      batchSize: 0,
+    });
+    return;
+  }
+
+  await recordOrderProgress('order_history', {
+    total: progressTotal,
+    uploaded,
+    pending: pagePending(),
+    failed: failedSnapshot().length,
+    currentOrderId: null,
+    currentOrderIndex: null,
+    resumeOrderId: resumeOrderId(),
+    failedOrderIds: failedSnapshot(),
+    snapshotKeys: rows.map((entry) => entry.orderId),
+    pendingOrderIds: pendingSnapshot(),
+    lastError,
+    listPhase: 'processing',
+  }, 'running', state, `订单历史批次开始：本轮处理 ${batch.length} 单。`, {
+    action: 'batch_started',
+    batchSize: batch.length,
+    resumeOrderId: resumeOrderId(),
+  });
+
+  let stopped = false;
+  for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+    const pendingRow = batch[batchIndex]!;
+    const orderId = pendingRow.orderId;
+    const orderIndex = rows.findIndex((entry) => entry.orderId === orderId);
+    await recordOrderProgress('order_history', {
+      total: progressTotal,
+      uploaded,
+      pending: pagePending(),
+      failed: failedSnapshot().length,
+      currentOrderId: orderId,
+      currentOrderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+      resumeOrderId: resumeOrderId(),
+      failedOrderIds: failedSnapshot(),
+      pendingOrderIds: pendingSnapshot(),
+      lastError,
+    }, 'running', state, `订单历史开始处理：${orderId}`, {
+      action: 'order_started',
+      orderId,
+      orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+      batchIndex: batchIndex + 1,
+      batchSize: batch.length,
+    });
+
+    let attemptError: string | null = null;
+    try {
+      if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
+        stopped = true;
+        break;
+      }
+      const historyUrl = tiktokOrderEndpointUrl(
+        'https://seller.tiktokshopglobalselling.com',
+        'order-history',
+        { sellerId: boundTab.sellerId! },
+        createOrderHistoryQuery(orderId),
+      );
+      const requestStartedAt = Date.now();
+      let detail: BoundTikTokResponse;
+      try {
+        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, historyUrl, {}, 'GET');
+      } catch (error) {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史请求异常。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined),
+          ...orderRequestExceptionDetails(error),
+        });
+        throw error;
+      }
+      const detailPayload = isRecord(detail.payload) ? detail.payload : null;
+      const detailBusinessFailure = detailPayload === null
+        ? null
+        : tiktokBusinessFailure(detailPayload, '订单历史');
+      if (!detail.ok) {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应失败。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        if (isTikTokAuthenticationFailure(detail)) {
+          await clearOrderBinding(state, 'order_history_authentication_failed');
+          stopped = true;
+        }
+        attemptError = orderTikTokFailureSummary('订单历史请求失败', detail);
+      } else if (isTikTokAuthenticationFailure(detail)) {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应要求重新登录。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          failureReason: 'authentication_required',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        await clearOrderBinding(state, 'order_history_authentication_failed');
+        stopped = true;
+        attemptError = '订单历史请求需要重新登录。';
+      } else if (detailPayload === null) {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应为空。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          failureReason: 'empty_payload',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        attemptError = `订单历史响应为空（${nullPayloadDiagnostic(detail)}）`;
+      } else if (detailBusinessFailure !== null) {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史业务响应失败。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          failureReason: 'business_code',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        attemptError = detailBusinessFailure;
+      } else {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'succeeded', '订单历史响应已解析。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
+          stopped = true;
+          break;
+        }
+        const uploadStartedAt = Date.now();
+        try {
+          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+            domain: 'orders',
+            endpoint: historyUrl,
+            method: 'GET',
+            request: {},
+            response: { status: detail.status, body: detailPayload },
+            createdAt: new Date().toISOString(),
+            mainOrderId: orderId,
+          }));
+          await recordOrderSyncRuntimeLog('order_history', 'erp_upload', 'succeeded', '订单历史已写入 ERP。', {
+            stage: 'tts_erp_upload',
+            orderId,
+            endpoint: orderTikTokEndpointPath(historyUrl),
+            durationMs: Math.max(0, Date.now() - uploadStartedAt),
+          });
+        } catch (error) {
+          await recordOrderSyncRuntimeLog('order_history', 'erp_upload', 'failed', '订单历史写入 ERP 失败。', {
+            stage: 'tts_erp_upload',
+            orderId,
+            endpoint: orderTikTokEndpointPath(historyUrl),
+            durationMs: Math.max(0, Date.now() - uploadStartedAt),
+            ...orderRequestExceptionDetails(error),
+          });
+          throw error;
+        }
+      }
+    } catch (error) {
+      attemptError = error instanceof Error ? error.message : String(error);
+    }
+
+    if (attemptError !== null) {
+      failedIds.add(orderId);
+      lastError = attemptError;
+      const pendingIndex = pendingKeys.indexOf(orderId);
+      if (pendingIndex >= 0) {
+        pendingKeys.splice(pendingIndex, 1);
+        pendingKeys.push(orderId);
+      } else {
+        pendingKeys.push(orderId);
+      }
+      await recordOrderProgress('order_history', {
+        total: progressTotal,
+        uploaded,
+        pending: pagePending(),
+        failed: failedSnapshot().length,
+        currentOrderId: null,
+        currentOrderIndex: null,
+        resumeOrderId: resumeOrderId(),
+        failedOrderIds: failedSnapshot(),
+        pendingOrderIds: pendingSnapshot(),
+        lastFailedOrderId: orderId,
+        lastError,
+      }, 'running', state, `订单历史失败：${orderId}（${attemptError}）`, {
+        action: 'order_failed',
+        orderId,
+        orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+        error: sanitizeDiagnosticText(attemptError).slice(0, 240),
+      });
+    } else {
+      const pendingIndex = pendingKeys.indexOf(orderId);
+      if (pendingIndex >= 0) pendingKeys.splice(pendingIndex, 1);
+      uploaded = uploadedBefore + terminalCount + Math.max(0, activeRows.length - pendingKeys.length);
+      preservedFailedIds.delete(orderId);
+      failedIds.delete(orderId);
+      lastError = failedIds.size > 0 ? lastError : null;
+      await recordOrderProgress('order_history', {
+        total: progressTotal,
+        uploaded,
+        pending: pagePending(),
+        failed: failedSnapshot().length,
+        currentOrderId: null,
+        currentOrderIndex: null,
+        resumeOrderId: resumeOrderId(),
+        failedOrderIds: failedSnapshot(),
+        pendingOrderIds: pendingSnapshot(),
+        lastSuccessAt: new Date().toISOString(),
+        lastError,
+      }, 'running', state, `订单历史同步成功：${orderId}`, {
+        action: 'order_succeeded',
+        orderId,
+        orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
+      });
+    }
+
+    if (!stopped && batchIndex < batch.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, ORDER_DETAIL_FETCH_DELAY_MS));
+    }
+    if (stopped) break;
+  }
+
+  const completed = !stopped && pendingKeys.length === 0 && failedIds.size === 0 && pendingAfterPage === 0;
+  await recordOrderProgress('order_history', {
+    total: progressTotal,
+    uploaded,
+    pending: pagePending(),
+    failed: failedSnapshot().length,
+    currentOrderId: null,
+    currentOrderIndex: null,
+    resumeOrderId: resumeOrderId(),
+    failedOrderIds: failedSnapshot(),
+    pendingOrderIds: pendingSnapshot(),
+    lastError: pagePending() > 0 ? lastError : null,
+    ...resetOrderListProgress(),
+  }, completed ? 'ok' : 'running', state,
+  completed
+    ? '订单历史批次完成：本轮全部订单已同步。'
+    : `订单历史批次完成：成功 ${uploaded} 单，待处理 ${pagePending()} 单。`, {
+    action: completed ? 'batch_completed' : 'batch_checkpointed',
+    batchSize: batch.length,
+    uploaded,
+    failed: failedSnapshot().length,
+    resumeOrderId: resumeOrderId(),
+  });
+  if (options.scheduleContinuation === false) return;
+  if (completed) {
+    if (typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(ORDER_HISTORY_CONTINUATION_ALARM);
+  } else if (!stopped) {
+    await chrome.alarms.create(ORDER_HISTORY_CONTINUATION_ALARM, {
+      delayInMinutes: LOGISTICS_CONTINUATION_DELAY_MINUTES,
+    });
+  }
+}
+
+
 type StatementPollingRow = {
   statementId: string;
   statementVersion: number;
@@ -2417,6 +3108,130 @@ function createOrderPagePipeline(
     });
   };
 
+  // ── order_details 队列（与物流同模式，N+1 逐单详情）──
+  const detailsFailedOrderIds = new Set<string>();
+  const detailsQueue: Array<{
+    rows: OrderListRow[];
+    total: number;
+    pendingAfterPage: number;
+    scheduleContinuation: boolean;
+  }> = [];
+  let detailsQueueRunning = false;
+  let detailsUploaded = 0;
+
+  const drainDetailsQueue = async (): Promise<void> => {
+    if (detailsQueueRunning) return;
+    detailsQueueRunning = true;
+    orderDomainInFlight.add('order_details');
+    try {
+      while (detailsQueue.length > 0) {
+        const item = detailsQueue.shift()!;
+        try {
+          await processOrderDetailsBatch(
+            state, settings, scope, boundTab, origin,
+            item.rows, 0,
+            {
+              total: item.total,
+              uploadedBefore: detailsUploaded,
+              pendingAfterPage: item.pendingAfterPage,
+              preservedFailedOrderIds: [...detailsFailedOrderIds],
+              scheduleContinuation: item.scheduleContinuation,
+            },
+          );
+          const afterDetails = await getOrderSyncState();
+          (afterDetails.orderProgress?.domains.order_details.failedOrderIds ?? [])
+            .forEach((orderId) => detailsFailedOrderIds.add(orderId));
+          detailsUploaded = Math.max(
+            detailsUploaded,
+            afterDetails.orderProgress?.domains.order_details.uploaded ?? detailsUploaded,
+          );
+        } catch (error) {
+          await recordOrderSyncRuntimeLog('order_details', 'queue_failed', 'failed', '订单详情页队列处理异常退出。', {
+            stage: 'order_details_page_queue',
+            error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
+          });
+          break;
+        }
+      }
+    } finally {
+      detailsQueueRunning = false;
+      orderDomainInFlight.delete('order_details');
+    }
+  };
+
+  const enqueueDetailsPage = (page: OrderListPage, total: number, pendingAfterPage: number): void => {
+    if (page.rows.length === 0) return;
+    detailsQueue.push({ rows: page.rows, total, pendingAfterPage, scheduleContinuation: !page.hasMore });
+    void drainDetailsQueue().catch(async (error) => {
+      await recordOrderSyncRuntimeLog('order_details', 'queue_failed', 'failed', '订单详情页队列启动异常退出。', {
+        stage: 'order_details_page_queue',
+        error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
+      });
+    });
+  };
+
+  // ── order_history 队列（与物流同模式，N+1 逐单历史）──
+  const historyFailedOrderIds = new Set<string>();
+  const historyQueue: Array<{
+    rows: OrderListRow[];
+    total: number;
+    pendingAfterPage: number;
+    scheduleContinuation: boolean;
+  }> = [];
+  let historyQueueRunning = false;
+  let historyUploaded = 0;
+
+  const drainHistoryQueue = async (): Promise<void> => {
+    if (historyQueueRunning) return;
+    historyQueueRunning = true;
+    orderDomainInFlight.add('order_history');
+    try {
+      while (historyQueue.length > 0) {
+        const item = historyQueue.shift()!;
+        try {
+          await processOrderHistoryBatch(
+            state, settings, scope, boundTab, origin,
+            item.rows, 0,
+            {
+              total: item.total,
+              uploadedBefore: historyUploaded,
+              pendingAfterPage: item.pendingAfterPage,
+              preservedFailedOrderIds: [...historyFailedOrderIds],
+              scheduleContinuation: item.scheduleContinuation,
+            },
+          );
+          const afterHistory = await getOrderSyncState();
+          (afterHistory.orderProgress?.domains.order_history.failedOrderIds ?? [])
+            .forEach((orderId) => historyFailedOrderIds.add(orderId));
+          historyUploaded = Math.max(
+            historyUploaded,
+            afterHistory.orderProgress?.domains.order_history.uploaded ?? historyUploaded,
+          );
+        } catch (error) {
+          await recordOrderSyncRuntimeLog('order_history', 'queue_failed', 'failed', '订单历史页队列处理异常退出。', {
+            stage: 'order_history_page_queue',
+            error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
+          });
+          break;
+        }
+      }
+    } finally {
+      historyQueueRunning = false;
+      orderDomainInFlight.delete('order_history');
+    }
+  };
+
+  const enqueueHistoryPage = (page: OrderListPage, total: number, pendingAfterPage: number): void => {
+    if (page.rows.length === 0) return;
+    historyQueue.push({ rows: page.rows, total, pendingAfterPage, scheduleContinuation: !page.hasMore });
+    void drainHistoryQueue().catch(async (error) => {
+      await recordOrderSyncRuntimeLog('order_history', 'queue_failed', 'failed', '订单历史页队列启动异常退出。', {
+        stage: 'order_history_page_queue',
+        error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
+      });
+    });
+  };
+
   return async (page) => {
     const total = page.totalRows ?? Math.max(page.fetchedRows, uploaded + page.rows.length);
     const logisticsRows = page.allRows ?? page.rows;
@@ -2509,6 +3324,9 @@ function createOrderPagePipeline(
         consumer: 'logistics',
       });
       enqueueLogisticsPage({ ...page, rows: logisticsRows }, total, futureScanPending);
+      // order_details 和 order_history 与物流相同（N+1 模式），也在此处入队。
+      enqueueDetailsPage({ ...page, rows: logisticsRows }, total, futureScanPending);
+      enqueueHistoryPage({ ...page, rows: logisticsRows }, total, futureScanPending);
       await recordOrderSyncRuntimeLog('orders', 'page_settlement_deferred', 'skipped', '结算接口是全局分页接口，没有订单号过滤参数，本订单页不重复发起结算查询。', {
         stage: 'order_page_pipeline',
         page: page.page,
@@ -2819,24 +3637,36 @@ export async function pollOrderDomain(
 
 async function launchManualOrderDomainSync(retryFailedOnly: boolean): Promise<void> {
   const state = await getOrderSyncState();
+  const ALL_MANUAL_DOMAINS: OrderPollingDomain[] = ['orders', 'logistics', 'statements', 'order_details', 'order_history'];
   const domains: OrderPollingDomain[] = retryFailedOnly
-    ? (['orders', 'logistics', 'statements'] as const).filter((domain) => {
+    ? ALL_MANUAL_DOMAINS.filter((domain) => {
       const row = state.orderProgress?.domains[domain];
       return Boolean(row && (row.lastError || row.pending > 0 || (row.failed ?? 0) > 0
         || row.syncRunStatus === 'partial_failed' || row.syncRunStatus === 'interrupted'));
     })
-    : ['orders', 'logistics', 'statements'];
+    : [...ALL_MANUAL_DOMAINS];
   if (domains.length === 0) return;
+  const removeFromDomains = (d: OrderPollingDomain): void => {
+    const idx = domains.indexOf(d);
+    if (idx >= 0) domains.splice(idx, 1);
+  };
   if (domains.includes('orders')) {
     const pagePipelineUsed = await handleOrderSyncAlarm('manual');
-    // Streaming order pages drive the logistics consumer; only the non-streaming path
-    // needs a separate logistics list request.
-    if (!pagePipelineUsed && domains.includes('logistics')) await pollOrderDomain('logistics', 'manual');
-    domains.splice(domains.indexOf('orders'), 1);
-    const logisticsIndex = domains.indexOf('logistics');
-    if (logisticsIndex >= 0) domains.splice(logisticsIndex, 1);
+    // Streaming order pages drive the logistics/details/history consumer; only the non-streaming
+    // path needs standalone discovery.
+    if (!pagePipelineUsed) {
+      if (domains.includes('logistics')) await pollOrderDomain('logistics', 'manual');
+      if (domains.includes('order_details')) await pollOrderDomain('order_details', 'manual');
+      if (domains.includes('order_history')) await pollOrderDomain('order_history', 'manual');
+    }
+    removeFromDomains('orders');
+    removeFromDomains('logistics');
+    removeFromDomains('order_details');
+    removeFromDomains('order_history');
   }
   if (domains.includes('logistics')) await pollOrderDomain('logistics', 'manual');
+  if (domains.includes('order_details')) await pollOrderDomain('order_details', 'manual');
+  if (domains.includes('order_history')) await pollOrderDomain('order_history', 'manual');
   if (domains.includes('statements')) await pollOrderDomain('statements', 'manual');
 }
 
@@ -3244,7 +4074,19 @@ export async function ensureBoundDomainAlarms(
   await ensureOrderSyncAlarm();
   await ensureLogisticsSyncAlarm();
   await ensureSettlementSyncAlarm();
+  await ensureOrderDetailsSyncAlarm();
+  await ensureOrderHistorySyncAlarm();
   void maybeStartInitialOrderDomainSync(initialSyncTrigger).catch(() => undefined);
+}
+
+
+export async function ensureOrderDetailsSyncAlarm(): Promise<void> {
+  await ensureBoundAlarm(ORDER_DETAILS_SYNC_ALARM, ORDER_DETAILS_SYNC_NEXT_DELAY_MINUTES, 'order_details');
+}
+
+
+export async function ensureOrderHistorySyncAlarm(): Promise<void> {
+  await ensureBoundAlarm(ORDER_HISTORY_SYNC_ALARM, ORDER_HISTORY_SYNC_NEXT_DELAY_MINUTES, 'order_history');
 }
 
 
@@ -3264,8 +4106,13 @@ export async function runInitialOrderDomainSync(
     // incremental paths without a page producer need standalone discovery.
     if (!orderPagePipelineUsed) await pollOrderDomain('logistics');
     await pollOrderDomain('statements');
+    // order_details 和 order_history 由 pipeline 自动入队；若 pipeline 未启动则手动触发。
+    if (!orderPagePipelineUsed) {
+      await pollOrderDomain('order_details');
+      await pollOrderDomain('order_history');
+    }
     const current = await getOrderSyncState();
-    const pendingDomains = (['orders', 'logistics', 'statements'] as const)
+    const pendingDomains = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const)
       .filter((domain) => !isOrderDomainRoundSettled(current.orderProgress?.domains[domain]));
     await recordOrderSyncRuntimeLog(
       'all',

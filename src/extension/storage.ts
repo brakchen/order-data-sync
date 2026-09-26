@@ -41,7 +41,7 @@ export function createDefaultOrderProgress(): OrderDomainProgress {
   return {
     status: 'idle',
     lastRunAt: null,
-    domains: { orders: row(), logistics: row(), statements: row() },
+    domains: { orders: row(), logistics: row(), statements: row(), order_details: row(), order_history: row() },
   };
 }
 
@@ -113,7 +113,7 @@ function normalizeOrderProgress(value: unknown): OrderDomainProgress {
   const base = createDefaultOrderProgress();
   if (!isRecord(value)) return base;
   const domains = isRecord(value.domains) ? value.domains : {};
-  for (const key of ['orders', 'logistics', 'statements'] as OrderDomainKey[]) {
+  for (const key of ['orders', 'logistics', 'statements', 'order_details', 'order_history'] as OrderDomainKey[]) {
     const row = domains[key];
     if (isRecord(row)) base.domains[key] = normalizeProgressRow(row);
   }

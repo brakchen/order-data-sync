@@ -8,6 +8,7 @@ import './style.css';
 type Reply<T> = { ok: true; data: T } | { ok: false; error: string };
 const DOMAIN_LABELS: Record<OrderDomainKey, string> = {
   orders: '订单', logistics: '物流', statements: '结算',
+  order_details: '订单详情', order_history: '订单历史',
 };
 
 function Popup() {
