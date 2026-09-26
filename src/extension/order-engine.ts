@@ -1275,7 +1275,9 @@ async function deferOrderDomainAlarm(domain: OrderPollingDomain): Promise<void> 
   if (continuation) return;
   const alarm = domain === 'orders' ? ORDER_SYNC_ALARM
     : domain === 'logistics' ? LOGISTICS_SYNC_ALARM
-      : SETTLEMENT_SYNC_ALARM;
+    : domain === 'order_details' ? ORDER_DETAILS_SYNC_ALARM
+    : domain === 'order_history' ? ORDER_HISTORY_SYNC_ALARM
+    : SETTLEMENT_SYNC_ALARM;
   await chrome.alarms.create(alarm, { delayInMinutes: ORDER_DOMAIN_BUSY_RETRY_DELAY_MINUTES });
 }
 
@@ -3871,6 +3873,30 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
       origin,
       orderRows!,
       logisticsSelection?.terminalSkipped ?? 0,
+    );
+    return;
+  }
+  if (domain === 'order_details') {
+    await processOrderDetailsBatch(
+      state,
+      settings,
+      scope,
+      boundTab,
+      origin,
+      orderRows!,
+      0,
+    );
+    return;
+  }
+  if (domain === 'order_history') {
+    await processOrderHistoryBatch(
+      state,
+      settings,
+      scope,
+      boundTab,
+      origin,
+      orderRows!,
+      0,
     );
     return;
   }
