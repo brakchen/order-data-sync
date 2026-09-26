@@ -2943,7 +2943,7 @@ async function recordOrderProgress(
 
 /** Persist active order-domain lifecycle events so an export can distinguish
  * "alarm never fired" from "TikTok returned empty" and "upload failed". */
-async function recordOrderSyncRuntimeLog(
+export async function recordOrderSyncRuntimeLog(
   domain: OrderPollingDomain | 'all',
   event: string,
   outcome: 'started' | 'succeeded' | 'failed' | 'skipped' | 'recorded',

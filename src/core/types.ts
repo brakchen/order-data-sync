@@ -75,6 +75,10 @@ export interface OrderBoundTab {
   url: string;
   sellerId?: string;
   advertiserId?: string;
+  shopName?: string;
+  shopCode?: string;
+  shopRegion?: string;
+  sellerRegionCode?: string;
   bindMode?: 'auto' | 'manual';
   boundAt?: string;
 }

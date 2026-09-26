@@ -73,14 +73,26 @@ export default defineContentScript({
   },
 });
 
-function isSellerIdentity(value: unknown): value is { sellerId: string; url: string; advertiserId?: string } {
+function isSellerIdentity(value: unknown): value is {
+  sellerId: string;
+  url: string;
+  advertiserId?: string;
+  shopName?: string;
+  shopCode?: string;
+  shopRegion?: string;
+  regionCode?: string;
+} {
   if (!isRecord(value) || typeof value.sellerId !== 'string' || !value.sellerId.trim()
     || typeof value.url !== 'string') return false;
   try {
     const url = new URL(value.url);
     return (url.origin === 'https://seller.tiktokglobalshop.com'
       || url.origin === 'https://seller.tiktokshopglobalselling.com')
-      && (value.advertiserId === undefined || typeof value.advertiserId === 'string');
+      && (value.advertiserId === undefined || typeof value.advertiserId === 'string')
+      && (value.shopName === undefined || typeof value.shopName === 'string')
+      && (value.shopCode === undefined || typeof value.shopCode === 'string')
+      && (value.shopRegion === undefined || typeof value.shopRegion === 'string')
+      && (value.regionCode === undefined || typeof value.regionCode === 'string');
   } catch { return false; }
 }
 

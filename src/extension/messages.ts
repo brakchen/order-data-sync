@@ -7,7 +7,18 @@ export type OrderExtensionMessage =
   | { type: 'order-sync:unbind-tab' }
   | { type: 'order-sync:sync-domains'; retryFailedOnly?: boolean }
   | { type: 'order-sync:stop-stuck-domain'; domain: OrderDomainKey }
-  | { type: 'order-sync:capture-seller'; payload: { sellerId: string; url: string; advertiserId?: string } };
+  | {
+    type: 'order-sync:capture-seller';
+    payload: {
+      sellerId: string;
+      url: string;
+      advertiserId?: string;
+      shopName?: string;
+      shopCode?: string;
+      shopRegion?: string;
+      regionCode?: string;
+    };
+  };
 
 export const ORDER_EXTENSION_MESSAGE_TYPES = [
   'order-sync:get-state',

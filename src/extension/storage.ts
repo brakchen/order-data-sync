@@ -192,6 +192,10 @@ function normalizeBoundTab(value: unknown): OrderBoundTab | null {
     url: value.url,
     ...(typeof value.sellerId === 'string' ? { sellerId: value.sellerId } : {}),
     ...(typeof value.advertiserId === 'string' ? { advertiserId: value.advertiserId } : {}),
+    ...(typeof value.shopName === 'string' ? { shopName: value.shopName } : {}),
+    ...(typeof value.shopCode === 'string' ? { shopCode: value.shopCode } : {}),
+    ...(typeof value.shopRegion === 'string' ? { shopRegion: value.shopRegion } : {}),
+    ...(typeof value.sellerRegionCode === 'string' ? { sellerRegionCode: value.sellerRegionCode } : {}),
     bindMode: value.bindMode === 'auto' ? 'auto' : 'manual',
     boundAt: typeof value.boundAt === 'string' ? value.boundAt : new Date(0).toISOString(),
   };

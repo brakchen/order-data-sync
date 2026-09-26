@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createDefaultOrderSettings } from '../../src/core/settings';
 import type { OrderExtensionMessage } from '../../src/extension/messages';
@@ -16,12 +16,18 @@ function Popup() {
   const [draft, setDraft] = useState<OrderSyncSettings>(createDefaultOrderSettings());
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
+  const settingsInitialized = useRef(false);
+  const lastSavedSettings = useRef('');
 
   const refresh = async (updateDraft = false) => {
     try {
       const result = await send<OrderSyncState>({ type: 'order-sync:get-state' });
       setState(result);
-      if (updateDraft) setDraft(result.settings);
+      if (updateDraft) {
+        settingsInitialized.current = true;
+        lastSavedSettings.current = serializeSettings(result.settings);
+        setDraft(result.settings);
+      }
     } catch (error) {
       setNotice(toMessage(error));
     }
@@ -46,7 +52,11 @@ function Popup() {
     try {
       const next = await action();
       setState(next);
-      if (updateDraft) setDraft(next.settings);
+      if (updateDraft) {
+        settingsInitialized.current = true;
+        lastSavedSettings.current = serializeSettings(next.settings);
+        setDraft(next.settings);
+      }
       setNotice(success);
     } catch (error) {
       setNotice(toMessage(error));
@@ -60,6 +70,19 @@ function Popup() {
     '配置已保存。',
     true,
   );
+  useEffect(() => {
+    if (!settingsInitialized.current) return undefined;
+    const serialized = serializeSettings(draft);
+    if (serialized === lastSavedSettings.current) return undefined;
+    const timer = window.setTimeout(() => {
+      void run(
+        () => send<OrderSyncState>({ type: 'order-sync:save-settings', settings: draft }),
+        '配置已自动保存。',
+        true,
+      );
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [draft]);
   const toggleBinding = () => state?.boundTab
     ? run(() => send<OrderSyncState>({ type: 'order-sync:unbind-tab' }), '已解绑 Seller Center 页面。')
     : run(() => send<OrderSyncState>({ type: 'order-sync:bind-tab' }), '已绑定页面，请等待 Seller 身份捕获。');
@@ -67,6 +90,28 @@ function Popup() {
     () => send<OrderSyncState>({ type: 'order-sync:sync-domains', retryFailedOnly }),
     retryFailedOnly ? '失败项已加入同步队列。' : '订单、物流和结算同步已启动。',
   );
+  const exportLogs = () => {
+    if (!state) return;
+    const exportedAt = new Date();
+    const payload = {
+      schemaVersion: 1,
+      exportedAt: exportedAt.toISOString(),
+      extensionVersion: chrome.runtime.getManifest().version,
+      boundTab: state.boundTab,
+      orderProgress: state.orderProgress,
+      runtimeLogs: state.runtimeLogs,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `order-data-sync-logs-${formatFileTimestamp(exportedAt)}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setNotice(`已导出 ${state.runtimeLogs.length} 条运行日志。`);
+  };
   const readyToSync = Boolean(state?.boundTab?.sellerId && state.settings.syncToken.trim()
     && state.settings.orderDomainSyncEnabled && !state.settings.syncPaused);
   const hasFailures = (['orders', 'logistics', 'statements'] as const).some((domain) => {
@@ -118,6 +163,8 @@ function Popup() {
           {hasFailures ? <button className="secondary" disabled={busy || !readyToSync}
             onClick={() => void sync(true)}>重试失败项</button> : null}
         </div>
+        <button className="secondary log-button" disabled={busy || !state}
+          onClick={exportLogs}>导出运行日志（{state?.runtimeLogs.length ?? 0}）</button>
         <div className="domain-list">
           {(['orders', 'logistics', 'statements'] as const).map((domain) => {
             const row = state?.orderProgress.domains[domain];
@@ -151,6 +198,19 @@ async function send<T>(message: OrderExtensionMessage): Promise<T> {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function formatFileTimestamp(value: Date): string {
+  return value.toISOString().replace(/[:.]/g, '-');
+}
+
+function serializeSettings(value: OrderSyncSettings): string {
+  return JSON.stringify({
+    syncBaseUrl: value.syncBaseUrl,
+    syncToken: value.syncToken,
+    syncPaused: value.syncPaused,
+    orderDomainSyncEnabled: value.orderDomainSyncEnabled,
+  });
 }
 
 function toMessage(error: unknown): string {
