@@ -4265,8 +4265,17 @@ export async function runInitialOrderDomainSync(
 
 
 async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger): Promise<void> {
+  const rawState = await getOrderSyncState();
   const state = await orderPollingState();
-  if (!state) return;
+  if (!state) {
+    if (rawState.boundTab && rawState.settings.syncToken.trim() && isOrderDomainSyncEnabled(rawState.settings)) {
+      await recordOrderSyncRuntimeLog('all', 'initial_sync_waiting', 'skipped', '首次订单同步等待 Seller ID 捕获，暂未发起订单接口请求。', {
+        stage: 'initial_sync',
+        ...orderPollingGateDetails(rawState),
+      });
+    }
+    return;
+  }
   // MV3 service workers can restart many times per day. An in-memory "started"
   // flag alone would rerun this bootstrap on each restart; only bootstrap a
   // store that has never recorded an order-domain run. Daily alarms and saved

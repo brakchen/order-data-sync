@@ -218,24 +218,34 @@ async function captureSellerIdentity(
     });
     return current;
   }
-  if (current.boundTab?.tabId !== senderTabId) {
+  let sameSellerCenterOrigin = false;
+  try {
+    sameSellerCenterOrigin = Boolean(current.boundTab)
+      && new URL(current.boundTab!.url).origin === new URL(payload.url).origin;
+  } catch {
+    sameSellerCenterOrigin = false;
+  }
+  if (current.boundTab?.tabId !== senderTabId && !sameSellerCenterOrigin) {
     await recordOrderSyncRuntimeLog('all', 'seller_identity_ignored', 'skipped', '忽略非当前绑定页面的 Seller ID 捕获消息。', {
       stage: 'seller_binding',
       reason: 'sender_tab_not_bound',
       senderTabId,
       boundTabId: current.boundTab?.tabId ?? null,
+      sameSellerCenterOrigin: false,
     });
     return current;
   }
+  const capturedFromBoundTab = current.boundTab?.tabId === senderTabId;
   const next = await mutateOrderSyncState((current) => {
-    if (current.boundTab?.tabId !== senderTabId) return current;
+    const boundTab = current.boundTab;
+    if (!boundTab || (boundTab.tabId !== senderTabId && !sameSellerCenterOrigin)) return current;
     const sellerId = payload.sellerId.trim();
     return {
       ...current,
       sellerBinding: { mode: 'idle', outcome: 'bound', deadlineAt: null },
       boundTab: {
-        ...current.boundTab,
-        url: payload.url,
+        ...boundTab,
+        ...(capturedFromBoundTab ? { url: payload.url } : {}),
         sellerId,
         ...(payload.advertiserId ? { advertiserId: payload.advertiserId } : {}),
         ...(payload.shopName ? { shopName: payload.shopName } : {}),
@@ -255,6 +265,10 @@ async function captureSellerIdentity(
     shopRegion: payload.shopRegion ?? null,
     regionCode: payload.regionCode ?? null,
     progressPreserved: true,
+    capturedFromBoundTab,
+    sameSellerCenterOrigin,
+    capturedFromTabId: senderTabId,
+    boundTabId: current.boundTab?.tabId ?? null,
     pageOrigin: new URL(payload.url).origin,
   });
   await ensureBoundAlarms('configuration_ready');

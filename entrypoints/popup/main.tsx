@@ -164,6 +164,7 @@ function Popup() {
 
       <section className="card">
         <div className="section-title"><h2>同步进度</h2><span className="caption">本机保存断点</span></div>
+        <div className="next-sync"><span>下次同步</span><strong>{formatNextSync(state)}</strong></div>
         <div className="sync-actions">
           <button disabled={busy || !readyToSync} onClick={() => void sync(false)}>立即同步</button>
           <button className="secondary" disabled={busy || !state}
@@ -204,6 +205,18 @@ async function send<T>(message: OrderExtensionMessage): Promise<T> {
 function formatTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function formatNextSync(state: OrderSyncState | null): string {
+  if (!state) return '加载中…';
+  if (state.orderProgress.status === 'running') return '同步进行中';
+  const nextSyncAt = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const)
+    .map((domain) => state.orderProgress.domains[domain].nextSyncAt)
+    .filter((value): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)))
+    .sort((left, right) => Date.parse(left) - Date.parse(right))[0];
+  if (nextSyncAt) return formatTime(nextSyncAt);
+  if (!state.boundTab?.sellerId || !state.settings.syncToken.trim()) return '等待配置';
+  return '首次同步准备中';
 }
 
 function formatFileTimestamp(value: Date): string {
