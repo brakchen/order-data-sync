@@ -31,7 +31,13 @@ vi.mock('../src/extension/storage', async () => {
   return {
     createDefaultOrderSyncState: actual.createDefaultOrderSyncState,
     createDefaultOrderProgress: actual.createDefaultOrderProgress,
-    mutateOrderSyncState: actual.mutateOrderSyncState,
+    mutateOrderSyncState: (mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>) =>
+      actual.runOrderSyncStateMutation(async () => {
+        const current = await mocks.getState();
+        const next = await mutation(current);
+        await mocks.saveState(next);
+        return next;
+      }),
     createSafeErrorSummary: vi.fn(() => '同步失败,请检查同步配置与网络。'),
     getOrderSyncState: mocks.getState,
     getOrderSyncStateWithinMutation: mocks.getStateWithinMutation,
@@ -120,7 +126,18 @@ function stubFetch(orderIds: string[]): void {
 }
 
 function uploadsForDomain(domain: 'orders' | 'logistics' | 'statements') {
-  return mocks.uploadDump.mock.calls.filter((call) => (call[2] as { domain?: string } | undefined)?.domain === domain);
+  return mocks.uploadDump.mock.calls.filter((call) => {
+    const dump = call[2] as { domain?: string; endpoint?: string } | undefined;
+    if (dump?.domain !== domain) return false;
+    // The order page producer intentionally stores detail/history dumps under
+    // the backend-supported `orders` domain. Existing assertions in this
+    // suite target the order-list producer, so distinguish it by endpoint.
+    if (domain === 'orders') {
+      return !dump.endpoint?.includes('/api/fulfillment/order/get')
+        && !dump.endpoint?.includes('/api/v1/fulfillment/order/history');
+    }
+    return true;
+  });
 }
 
 function withoutAdvertiser(): OrderSyncState {
@@ -170,7 +187,14 @@ beforeEach(() => {
   mocks.fetchReconciliation.mockResolvedValue(null);
   mocks.uploadDump.mockResolvedValue({ requestId: 'req-1' });
 });
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+afterEach(async () => {
+  // handleOrderSyncAlarm intentionally returns after the order-list producer;
+  // its logistics/detail/history consumers keep draining independently. Let
+  // those consumers finish before the next test resets fetch/state mocks.
+  await vi.advanceTimersByTimeAsync(120_000);
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe('订单域 alarm 注册规则', () => {
   it('已绑定店铺时注册为一次性下一轮 alarm', async () => {
@@ -269,7 +293,10 @@ describe('订单域首次主动同步', () => {
     }));
 
     const running = handleOrderSyncAlarm();
-    for (let index = 0; index < 30; index += 1) await Promise.resolve();
+    for (let index = 0; index < 200
+      && state.orderProgress?.domains.orders.listPhase !== 'list_fetching'; index += 1) {
+      await Promise.resolve();
+    }
 
     expect(state.orderProgress).toMatchObject({
       status: 'running',
@@ -514,7 +541,9 @@ describe('订单域（无 N+1）', () => {
       covered: 2,
       pending: 0,
     });
-    expect(state.orderProgress?.status).toBe('ok');
+    // 订单页生产者已完成；物流/详情/历史消费者仍可在后台收尾，整体状态
+    // 在它们完成前保持 running 是预期行为。
+    expect(state.orderProgress?.domains.orders.syncRunStatus).toBe('done');
   });
 
   it('降序列表新增订单时按新增前缀校验锚点，不误回退全量扫描', async () => {

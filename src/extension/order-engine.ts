@@ -3020,11 +3020,8 @@ export async function handleOrderSyncAlarm(trigger: OrderSyncTrigger = 'automati
   orderSyncInFlight = true;
   try {
     await beginOrderDomainRun('orders', trigger);
-    await beginOrderDomainRun('logistics', trigger);
-    await beginOrderDomainRun('order_details', trigger);
-    await beginOrderDomainRun('order_history', trigger);
     await recordOrderSyncRuntimeLog('orders', 'alarm_started', 'started', '订单主动轮询开始。', { trigger });
-    const pagePipelineUsed = await handleOrderSyncAlarmOnce();
+    const pagePipelineUsed = await handleOrderSyncAlarmOnce(trigger);
     const current = await getOrderSyncState();
     const row = current.orderProgress?.domains.orders;
     if (current.boundTab?.sellerId && current.settings.syncToken.trim()
@@ -3070,6 +3067,7 @@ function createOrderPagePipeline(
   scope: OrderSyncScope,
   boundTab: NonNullable<OrderSyncState['boundTab']>,
   origin: string,
+  trigger: OrderSyncTrigger,
 ): (page: OrderListPage) => Promise<void> {
   let uploaded = 0;
   const failedOrderIds = new Set<string>();
@@ -3082,6 +3080,7 @@ function createOrderPagePipeline(
     scheduleContinuation: boolean;
   }> = [];
   let logisticsQueueRunning = false;
+  let logisticsDrainPromise: Promise<void> | null = null;
   const orderUrl = tiktokOrderEndpointUrl(origin, 'order-list', { sellerId: boundTab.sellerId! });
 
   const drainLogisticsQueue = async (): Promise<void> => {
@@ -3089,6 +3088,7 @@ function createOrderPagePipeline(
     logisticsQueueRunning = true;
     orderDomainInFlight.add('logistics');
     try {
+      await beginOrderDomainRun('logistics', trigger);
       while (logisticsQueue.length > 0) {
         const item = logisticsQueue.shift()!;
         try {
@@ -3137,12 +3137,13 @@ function createOrderPagePipeline(
       pendingAfterPage,
       scheduleContinuation: !page.hasMore,
     });
-    void drainLogisticsQueue().catch(async (error) => {
+    if (logisticsDrainPromise) return;
+    logisticsDrainPromise = drainLogisticsQueue().catch(async (error) => {
       await recordOrderSyncRuntimeLog('logistics', 'queue_failed', 'failed', '物流页队列启动异常退出。', {
         stage: 'logistics_page_queue',
         error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
       });
-    });
+    }).finally(() => { logisticsDrainPromise = null; });
   };
 
   // ── order_details 队列（与物流同模式，N+1 逐单详情）──
@@ -3154,6 +3155,7 @@ function createOrderPagePipeline(
     scheduleContinuation: boolean;
   }> = [];
   let detailsQueueRunning = false;
+  let detailsDrainPromise: Promise<void> | null = null;
   let detailsUploaded = 0;
 
   const drainDetailsQueue = async (): Promise<void> => {
@@ -3161,6 +3163,7 @@ function createOrderPagePipeline(
     detailsQueueRunning = true;
     orderDomainInFlight.add('order_details');
     try {
+      await beginOrderDomainRun('order_details', trigger);
       while (detailsQueue.length > 0) {
         const item = detailsQueue.shift()!;
         try {
@@ -3199,12 +3202,13 @@ function createOrderPagePipeline(
   const enqueueDetailsPage = (page: OrderListPage, total: number, pendingAfterPage: number): void => {
     if (page.rows.length === 0) return;
     detailsQueue.push({ rows: page.rows, total, pendingAfterPage, scheduleContinuation: !page.hasMore });
-    void drainDetailsQueue().catch(async (error) => {
+    if (detailsDrainPromise) return;
+    detailsDrainPromise = drainDetailsQueue().catch(async (error) => {
       await recordOrderSyncRuntimeLog('order_details', 'queue_failed', 'failed', '订单详情页队列启动异常退出。', {
         stage: 'order_details_page_queue',
         error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
       });
-    });
+    }).finally(() => { detailsDrainPromise = null; });
   };
 
   // ── order_history 队列（与物流同模式，N+1 逐单历史）──
@@ -3216,6 +3220,7 @@ function createOrderPagePipeline(
     scheduleContinuation: boolean;
   }> = [];
   let historyQueueRunning = false;
+  let historyDrainPromise: Promise<void> | null = null;
   let historyUploaded = 0;
 
   const drainHistoryQueue = async (): Promise<void> => {
@@ -3223,6 +3228,7 @@ function createOrderPagePipeline(
     historyQueueRunning = true;
     orderDomainInFlight.add('order_history');
     try {
+      await beginOrderDomainRun('order_history', trigger);
       while (historyQueue.length > 0) {
         const item = historyQueue.shift()!;
         try {
@@ -3261,15 +3267,16 @@ function createOrderPagePipeline(
   const enqueueHistoryPage = (page: OrderListPage, total: number, pendingAfterPage: number): void => {
     if (page.rows.length === 0) return;
     historyQueue.push({ rows: page.rows, total, pendingAfterPage, scheduleContinuation: !page.hasMore });
-    void drainHistoryQueue().catch(async (error) => {
+    if (historyDrainPromise) return;
+    historyDrainPromise = drainHistoryQueue().catch(async (error) => {
       await recordOrderSyncRuntimeLog('order_history', 'queue_failed', 'failed', '订单历史页队列启动异常退出。', {
         stage: 'order_history_page_queue',
         error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
       });
-    });
+    }).finally(() => { historyDrainPromise = null; });
   };
 
-  return async (page) => {
+  const pagePipeline = async (page: OrderListPage): Promise<void> => {
     const total = page.totalRows ?? Math.max(page.fetchedRows, uploaded + page.rows.length);
     const logisticsRows = page.allRows ?? page.rows;
     const futureScanPending = page.hasMore ? Math.max(0, total - page.fetchedRows) : 0;
@@ -3421,10 +3428,11 @@ function createOrderPagePipeline(
       nextPage: page.hasMore ? page.page + 1 : null,
     });
   };
+  return pagePipeline;
 }
 
 
-async function handleOrderSyncAlarmOnce(): Promise<boolean> {
+async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<boolean> {
   const rawState = await getOrderSyncState();
   const state = await orderPollingState();
   if (!state) {
@@ -3442,6 +3450,7 @@ async function handleOrderSyncAlarmOnce(): Promise<boolean> {
     scope,
     boundTab,
     boundSellerCenterOrigin(boundTab.url),
+    trigger,
   );
 
   let selection: OrderRoundSelection;
