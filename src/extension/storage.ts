@@ -1,5 +1,5 @@
 import { ORDER_RUNTIME_LOG_LIMIT, ORDER_SYNC_STATE_KEY, createDefaultOrderSettings, normalizeOrderSyncSettings } from '../core/settings';
-import type { OrderBoundTab, OrderDomainKey, OrderDomainProgress, OrderDomainProgressRow, OrderListCheckpoint, OrderRuntimeLog, OrderSyncState } from '../core/types';
+import type { OrderBoundTab, OrderDomainKey, OrderDomainProgress, OrderDomainProgressRow, OrderListCheckpoint, OrderRuntimeLog, OrderSyncState, SellerBindingState } from '../core/types';
 
 export function createDefaultOrderProgress(): OrderDomainProgress {
   const row = (): OrderDomainProgressRow => ({
@@ -49,6 +49,7 @@ export function createDefaultOrderSyncState(now = new Date().toISOString()): Ord
   return {
     settings: createDefaultOrderSettings(),
     boundTab: null,
+    sellerBinding: { mode: 'idle', outcome: 'none', deadlineAt: null },
     shopRegion: null,
     orderProgress: createDefaultOrderProgress(),
     runtimeLogs: [],
@@ -101,11 +102,23 @@ export function normalizeOrderSyncState(value: unknown): OrderSyncState {
   return {
     settings: normalizeOrderSyncSettings(value.settings),
     boundTab: normalizeBoundTab(value.boundTab),
+    sellerBinding: normalizeSellerBinding(value.sellerBinding),
     shopRegion: normalizeShopRegion(value.shopRegion),
     orderProgress: normalizeOrderProgress(value.orderProgress),
     runtimeLogs: normalizeRuntimeLogs(value.runtimeLogs),
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : base.createdAt,
     updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : base.updatedAt,
+  };
+}
+
+function normalizeSellerBinding(value: unknown): SellerBindingState {
+  const mode = isRecord(value) && (value.mode === 'auto' || value.mode === 'manual') ? value.mode : 'idle';
+  const outcome = isRecord(value) && (value.outcome === 'bound' || value.outcome === 'timeout' || value.outcome === 'failed')
+    ? value.outcome : 'none';
+  return {
+    mode,
+    outcome,
+    deadlineAt: isRecord(value) && typeof value.deadlineAt === 'string' ? value.deadlineAt : null,
   };
 }
 

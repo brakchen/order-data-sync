@@ -114,6 +114,9 @@ function Popup() {
   };
   const readyToSync = Boolean(state?.boundTab?.sellerId && state.settings.syncToken.trim()
     && state.settings.orderDomainSyncEnabled && !state.settings.syncPaused);
+  const bindingInProgress = state?.sellerBinding.mode !== 'idle';
+  const automaticBinding = state?.sellerBinding.mode === 'auto';
+  const automaticBindingTimedOut = state?.sellerBinding.outcome === 'timeout';
   const hasFailures = (['orders', 'logistics', 'statements'] as const).some((domain) => {
     const row = state?.orderProgress.domains[domain];
     return Boolean(row && (row.lastError || row.pending > 0 || (row.failed ?? 0) > 0
@@ -151,9 +154,12 @@ function Popup() {
         </span></div>
         <p className="description">订单插件使用当前登录页面会话读取订单、物流和结算数据。</p>
         {state?.boundTab ? <dl><dt>Seller ID</dt><dd>{state.boundTab.sellerId ?? '等待页面请求捕获'}</dd></dl> : null}
-        <button disabled={busy} onClick={() => void toggleBinding()}>
-          {busy ? '处理中…' : state?.boundTab ? '解除页面绑定' : '绑定当前 Seller Center 页面'}
+        <button disabled={busy || bindingInProgress} onClick={() => void toggleBinding()}>
+          {automaticBinding ? '自动绑定中…' : busy ? '处理中…' : state?.boundTab ? '解除页面绑定' : '绑定当前 Seller Center 页面'}
         </button>
+        {automaticBinding ? <small className="caption binding-hint">正在搜索可用页面，最多等待 10 秒；期间手动绑定已暂时禁用。</small> : null}
+        {!automaticBinding && automaticBindingTimedOut && !state?.boundTab?.sellerId
+          ? <small className="error binding-hint">自动绑定超时，请手动绑定当前 Seller Center 页面。</small> : null}
       </section>
 
       <section className="card">

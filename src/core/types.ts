@@ -83,6 +83,15 @@ export interface OrderBoundTab {
   boundAt?: string;
 }
 
+export type SellerBindingMode = 'idle' | 'auto' | 'manual';
+export type SellerBindingOutcome = 'none' | 'bound' | 'timeout' | 'failed';
+
+export interface SellerBindingState {
+  mode: SellerBindingMode;
+  outcome: SellerBindingOutcome;
+  deadlineAt: string | null;
+}
+
 export interface OrderShopRegion {
   sellerId: string;
   baseUrl: string;
@@ -101,6 +110,7 @@ export interface OrderRuntimeLog {
 export interface OrderSyncState {
   settings: OrderSyncSettings;
   boundTab: OrderBoundTab | null;
+  sellerBinding: SellerBindingState;
   shopRegion: OrderShopRegion | null;
   orderProgress: OrderDomainProgress;
   runtimeLogs: OrderRuntimeLog[];
