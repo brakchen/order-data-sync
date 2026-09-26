@@ -103,15 +103,25 @@ function isTikTokLoginRequiredResponse(response: unknown): boolean {
   return response.code === 11000 || response.code === '11000' || extra.i18n_key === 'not_login';
 }
 
-async function clearOrderBinding(_reason = 'unknown'): Promise<void> {
-  await runOrderSyncStateMutation(async () => {
+async function clearOrderBinding(
+  expectedState: OrderSyncState,
+  _reason = 'unknown',
+): Promise<void> {
+  const cleared = await runOrderSyncStateMutation(async () => {
     const current = await getOrderSyncStateWithinMutation();
+    if (current.boundTab?.tabId !== expectedState.boundTab?.tabId
+      || current.boundTab?.sellerId !== expectedState.boundTab?.sellerId
+      || normaliseOrderSyncBaseUrl(current.settings.syncBaseUrl)
+        !== normaliseOrderSyncBaseUrl(expectedState.settings.syncBaseUrl)
+      || current.settings.syncToken.trim() !== expectedState.settings.syncToken.trim()) return false;
     await saveOrderSyncState({ ...current, boundTab: null, shopRegion: null });
+    for (const name of [ORDER_SYNC_ALARM, ORDER_CONTINUATION_ALARM, LOGISTICS_SYNC_ALARM,
+      LOGISTICS_CONTINUATION_ALARM, SETTLEMENT_SYNC_ALARM, SETTLEMENT_CONTINUATION_ALARM]) {
+      await chrome.alarms.clear(name);
+    }
+    return true;
   });
-  for (const name of [ORDER_SYNC_ALARM, ORDER_CONTINUATION_ALARM, LOGISTICS_SYNC_ALARM,
-    LOGISTICS_CONTINUATION_ALARM, SETTLEMENT_SYNC_ALARM, SETTLEMENT_CONTINUATION_ALARM]) {
-    await chrome.alarms.clear(name);
-  }
+  if (!cleared) return;
 }
 
 export async function reportSchedulerError(error: unknown): Promise<void> {
@@ -1065,7 +1075,7 @@ async function fetchOrderListRows(
         ...orderTikTokRuntimeExchange('POST', url, body, result),
         ...orderTikTokResponseDiagnostics(result),
       });
-      if (isTikTokAuthenticationFailure(result)) await clearOrderBinding('order_authentication_failed');
+      if (isTikTokAuthenticationFailure(result)) await clearOrderBinding(state, 'order_authentication_failed');
       throw new Error(orderTikTokFailureSummary('订单列表请求失败', result));
     }
     if (isTikTokAuthenticationFailure(result)) {
@@ -1080,7 +1090,7 @@ async function fetchOrderListRows(
         ...orderTikTokRuntimeExchange('POST', url, body, result),
         ...orderTikTokResponseDiagnostics(result),
       });
-      await clearOrderBinding('order_authentication_failed');
+      await clearOrderBinding(state, 'order_authentication_failed');
       throw new Error('订单列表请求需要重新登录。');
     }
     const payload = isRecord(result.payload) ? result.payload : {};
@@ -1751,7 +1761,7 @@ async function processLogisticsBatch(
           ...orderTikTokResponseDiagnostics(detail),
         });
         if (isTikTokAuthenticationFailure(detail)) {
-          await clearOrderBinding('logistics_authentication_failed');
+          await clearOrderBinding(state, 'logistics_authentication_failed');
           stopped = true;
         }
         attemptError = orderTikTokFailureSummary('详情请求失败', detail);
@@ -1766,7 +1776,7 @@ async function processLogisticsBatch(
           ...orderTikTokRuntimeExchange('GET', detailUrl, undefined, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
-        await clearOrderBinding('logistics_authentication_failed');
+        await clearOrderBinding(state, 'logistics_authentication_failed');
         stopped = true;
         attemptError = '物流详情请求需要重新登录。';
       } else if (detailPayload === null) {
@@ -2008,7 +2018,7 @@ async function fetchStatementRows(state: OrderSyncState): Promise<StatementPolli
         ...orderTikTokRuntimeExchange('GET', url, undefined, result),
         ...orderTikTokResponseDiagnostics(result),
       });
-      if (isTikTokAuthenticationFailure(result)) await clearOrderBinding('statement_authentication_failed');
+      if (isTikTokAuthenticationFailure(result)) await clearOrderBinding(state, 'statement_authentication_failed');
       throw new Error(orderTikTokFailureSummary('结算列表请求失败', result));
     }
     if (isTikTokAuthenticationFailure(result)) {
@@ -2023,7 +2033,7 @@ async function fetchStatementRows(state: OrderSyncState): Promise<StatementPolli
         ...orderTikTokRuntimeExchange('GET', url, undefined, result),
         ...orderTikTokResponseDiagnostics(result),
       });
-      await clearOrderBinding('statement_authentication_failed');
+      await clearOrderBinding(state, 'statement_authentication_failed');
       throw new Error('结算列表请求需要重新登录。');
     }
     const parsed = StatementListResponseSchema.safeParse(result.payload);
@@ -2165,10 +2175,19 @@ async function recordOrderProgress(
       syncRunStatus: status === 'running' ? 'running' : status === 'ok' ? 'done' : 'partial_failed',
       ...(status === 'ok' ? { lastSuccessAt: progressAt } : {}),
     };
+    const domains = { ...base.domains, [domain]: nextRow };
+    const domainStatuses = Object.values(domains).map((progressRow) => progressRow.syncRunStatus);
+    const overallStatus: OrderDomainProgress['status'] = domainStatuses.includes('running')
+      ? 'running'
+      : domainStatuses.includes('partial_failed') || domainStatuses.includes('interrupted')
+        ? 'partial'
+        : domainStatuses.includes('done')
+          ? 'ok'
+          : status;
     const next: OrderDomainProgress = {
-      status,
+      status: overallStatus,
       lastRunAt: progressAt,
-      domains: { ...base.domains, [domain]: nextRow },
+      domains,
     };
     const tail: OrderRuntimeLog[] = note === undefined ? [] : [{
       id: `order-sync-${domain}-${Date.now()}`,
@@ -2346,7 +2365,7 @@ function createOrderPagePipeline(
         const item = logisticsQueue.shift()!;
         try {
           await processLogisticsBatch(
-            await getOrderSyncState(),
+            state,
             settings,
             scope,
             boundTab,
@@ -2452,7 +2471,7 @@ function createOrderPagePipeline(
     for (let chunkStart = 0; chunkStart < pageEntries.length; chunkStart += ORDER_DOMAIN_BATCH_SIZE) {
       const chunk = pageEntries.slice(chunkStart, chunkStart + ORDER_DOMAIN_BATCH_SIZE);
       await processOrderDomainBatch(
-        await getOrderSyncState(),
+        state,
         'orders',
         chunk,
         0,
@@ -2611,6 +2630,9 @@ async function handleOrderSyncAlarmOnce(): Promise<boolean> {
       await scheduleOrderDomainRetryAfterListFailure('orders', state);
       return true;
     }
+    const streamedOrderStatus = streamedRow?.syncRunStatus === 'running' ? 'running'
+      : streamedRow?.syncRunStatus === 'partial_failed' || streamedRow?.lastError ? 'partial'
+        : 'ok';
     await recordOrderProgress('orders', {
       syncStrategy: selection.strategy,
       reconcileStatus: selection.reconcileStatus,
@@ -2621,7 +2643,7 @@ async function handleOrderSyncAlarmOnce(): Promise<boolean> {
         ? { orderListCheckpoint: selection.checkpoint }
         : {}),
       lastReconciledAt: reconciliation ? new Date().toISOString() : null,
-    }, streamedState.orderProgress?.status ?? 'running', state, selection.strategy === 'incremental'
+    }, streamedOrderStatus, state, selection.strategy === 'incremental'
       ? '订单采用本地 checkpoint 增量分页同步：本轮按页处理新增、热区和历史巡检。'
       : selection.strategy === 'repair'
         ? '订单进入精确修复：读取当前列表并按服务端存在性补齐缺口。'
@@ -3122,7 +3144,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
               ...orderTikTokResponseDiagnostics(detail),
             });
             if (isTikTokAuthenticationFailure(detail)) {
-              await clearOrderBinding('statement_authentication_failed');
+              await clearOrderBinding(state, 'statement_authentication_failed');
               throw new StopOrderDomainBatch('结算明细请求需要重新登录。');
             }
             throw new Error(orderTikTokFailureSummary('结算明细请求失败', detail));
@@ -3139,7 +3161,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
               ...orderTikTokRuntimeExchange('GET', detailUrl, undefined, detail),
               ...orderTikTokResponseDiagnostics(detail),
             });
-            await clearOrderBinding('statement_authentication_failed');
+            await clearOrderBinding(state, 'statement_authentication_failed');
             throw new StopOrderDomainBatch('结算明细请求需要重新登录。');
           }
           if (detailPayload === null) {
