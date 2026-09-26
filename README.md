@@ -18,4 +18,4 @@ npm run build
 
 ## 仓库初始化
 
-GitHub 项目尚未创建。创建后，将 `ads-data-sync/.gitmodules` 中的 `https://github.com/<GITHUB_OWNER>/<ORDER_PLUGIN_REPOSITORY>.git` 替换成实际地址，并推送本仓库的 `order-data-sync/` 初始提交。
+GitHub 项目尚未创建。创建后，将 `ads-data-sync/.gitmodules` 中的 `https://github.com/REPLACE_ME/tiktok-shop-order-data-sync.git` 替换成实际地址，并推送本仓库的 `order-data-sync/` 初始提交。
