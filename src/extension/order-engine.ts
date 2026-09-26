@@ -58,6 +58,11 @@ export const ORDER_SYNC_ALARMS = {
   orderDetailsContinue: 'order-data-sync:order-details:continue',
   orderHistoryContinue: 'order-data-sync:order-history:continue',
 } as const;
+export const SELLER_TAB_ALARMS = {
+  refresh: 'order-data-sync:seller-tab-refresh',
+  watch: 'order-data-sync:seller-tab-watch',
+} as const;
+export const SELLER_TAB_WATCH_DELAY_MINUTES = 1;
 const TIKTOK_SELLER_CENTER_ORIGINS = [
   'https://seller.tiktokglobalshop.com',
   'https://seller.tiktokshopglobalselling.com',
@@ -80,9 +85,37 @@ function runtimeLogContext(
     event,
     outcome,
     ...(Object.keys(safeDetails).length ? { details: safeDetails } : {}),
-    ...(rawRequest === undefined ? {} : { request: rawRequest }),
-    ...(rawResponse === undefined ? {} : { response: rawResponse }),
+    ...(rawRequest === undefined ? {} : { request: sanitizeRuntimeLogValue(rawRequest) }),
+    ...(rawResponse === undefined ? {} : { response: sanitizeRuntimeLogValue(rawResponse) }),
   };
+}
+
+const RUNTIME_SECRET_KEY = /(token|auth|authorization|cookie|password|secret|credential|signature|bsid|access[_-]?key|refresh[_-]?token)/i;
+
+function sanitizeRuntimeLogValue(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (/^https?:\/\//i.test(value)) return sanitizeRuntimeUrl(value);
+    return sanitizeDiagnosticText(value).slice(0, 20_000);
+  }
+  if (Array.isArray(value)) return value.map((item) => sanitizeRuntimeLogValue(item));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    RUNTIME_SECRET_KEY.test(key) ? '[REDACTED]' : sanitizeRuntimeLogValue(item),
+  ]));
+}
+
+function sanitizeRuntimeUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    for (const key of [...url.searchParams.keys()]) {
+      if (RUNTIME_SECRET_KEY.test(key) || /^(fp|verify)$/i.test(key)) url.searchParams.set(key, '[REDACTED]');
+    }
+    url.hash = '';
+    return url.toString().slice(0, 4_000);
+  } catch {
+    return sanitizeDiagnosticText(value).slice(0, 4_000);
+  }
 }
 
 function summarizeRuntimeValueShape(value: unknown): { fields: string[] } {
@@ -110,7 +143,7 @@ function isTikTokLoginRequiredResponse(response: unknown): boolean {
 
 async function clearOrderBinding(
   expectedState: OrderSyncState,
-  _reason = 'unknown',
+  reason = 'unknown',
 ): Promise<void> {
   const cleared = await runOrderSyncStateMutation(async () => {
     const current = await getOrderSyncStateWithinMutation();
@@ -119,20 +152,44 @@ async function clearOrderBinding(
       || normaliseOrderSyncBaseUrl(current.settings.syncBaseUrl)
         !== normaliseOrderSyncBaseUrl(expectedState.settings.syncBaseUrl)
       || current.settings.syncToken.trim() !== expectedState.settings.syncToken.trim()) return false;
-    await saveOrderSyncState({ ...current, boundTab: null, shopRegion: null });
+    if (!current.boundTab) return false;
+    const { sellerId: _sellerId, ...boundTabWithoutSellerId } = current.boundTab;
+    await saveOrderSyncState({
+      ...current,
+      boundTab: boundTabWithoutSellerId,
+      shopRegion: null,
+    });
     for (const name of [ORDER_SYNC_ALARM, ORDER_CONTINUATION_ALARM, LOGISTICS_SYNC_ALARM,
       LOGISTICS_CONTINUATION_ALARM, SETTLEMENT_SYNC_ALARM, SETTLEMENT_CONTINUATION_ALARM,
       ORDER_DETAILS_SYNC_ALARM, ORDER_DETAILS_CONTINUATION_ALARM,
       ORDER_HISTORY_SYNC_ALARM, ORDER_HISTORY_CONTINUATION_ALARM]) {
       await chrome.alarms.clear(name);
     }
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
+    await chrome.alarms.create(SELLER_TAB_ALARMS.watch, {
+      delayInMinutes: SELLER_TAB_WATCH_DELAY_MINUTES,
+    });
     return true;
   });
   if (!cleared) return;
+  await recordOrderSyncRuntimeLog('all', 'seller_binding_auth_expired', 'skipped', 'Seller Center 会话已失效，已停止同步并保留断点，等待重新登录或同域名页面接管。', {
+    stage: 'seller_binding',
+    reason,
+    tabId: expectedState.boundTab?.tabId ?? null,
+    syncStopped: true,
+    sellerIdRemoved: true,
+    preservedProgress: true,
+    replacementScanScheduled: true,
+  });
 }
 
-export async function reportSchedulerError(error: unknown): Promise<void> {
+export async function reportSchedulerError(
+  error: unknown,
+  details: Record<string, unknown> = {},
+): Promise<void> {
   await recordOrderSyncRuntimeLog('all', 'scheduler_error', 'failed', '订单同步调度异常，保留断点等待重试。', {
+    ...details,
     error: sanitizeDiagnosticText(error instanceof Error ? error.message : String(error)).slice(0, 240),
   });
 }

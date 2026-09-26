@@ -12,13 +12,12 @@ import {
   reportSchedulerError,
   requestManualOrderDomainSync,
   runInitialOrderDomainSync,
+  SELLER_TAB_ALARMS,
+  SELLER_TAB_WATCH_DELAY_MINUTES,
   stopStuckOrderDomainAndRetry,
 } from '../src/extension/order-engine';
 
-const SELLER_TAB_REFRESH_ALARM = 'order-data-sync:seller-tab-refresh';
 const SELLER_TAB_REFRESH_DELAY_MINUTES = 120;
-const SELLER_TAB_WATCH_ALARM = 'order-data-sync:seller-tab-watch';
-const SELLER_TAB_WATCH_DELAY_MINUTES = 1;
 
 export default defineBackground(() => {
   chrome.runtime.onMessage.addListener((message: OrderExtensionMessage, sender, sendResponse) => {
@@ -32,30 +31,30 @@ export default defineBackground(() => {
   });
 
   chrome.tabs.onRemoved.addListener((tabId) => {
-    void handleBoundTabRemoved(tabId).catch(reportError);
+    void handleBoundTabRemoved(tabId).catch((error) => reportError(error, 'tab_removed'));
   });
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.pinned !== undefined) {
       void ensureBoundSellerTabRefreshAlarm().catch(reportSchedulerError);
     }
     if (changeInfo.url && isTikTokLoginPage(changeInfo.url)) {
-      void handleLoginRedirect(tabId).catch(reportError);
+      void handleLoginRedirect(tabId).catch((error) => reportError(error, 'login_redirect'));
     }
   });
 
-  void getOrderSyncState().catch(reportError);
+  void getOrderSyncState().catch((error) => reportError(error, 'extension_startup'));
   void ensureBoundAlarms('extension_startup').catch(reportSchedulerError);
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ORDER_SYNC_ALARMS.orders || alarm.name === ORDER_SYNC_ALARMS.ordersContinue) {
-      void handleOrderSyncAlarm().catch(reportSchedulerError);
+      void handleOrderSyncAlarm().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.logistics || alarm.name === ORDER_SYNC_ALARMS.logisticsContinue) {
-      void pollOrderDomain('logistics').catch(reportSchedulerError);
+      void pollOrderDomain('logistics').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.statements || alarm.name === ORDER_SYNC_ALARMS.statementsContinue) {
-      void pollOrderDomain('statements').catch(reportSchedulerError);
-    } else if (alarm.name === SELLER_TAB_REFRESH_ALARM) {
-      void refreshBoundSellerTab().catch(reportSchedulerError);
-    } else if (alarm.name === SELLER_TAB_WATCH_ALARM) {
-      void scanForReplacementSellerTab().catch(reportSchedulerError);
+      void pollOrderDomain('statements').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
+    } else if (alarm.name === SELLER_TAB_ALARMS.refresh) {
+      void refreshBoundSellerTab().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
+    } else if (alarm.name === SELLER_TAB_ALARMS.watch) {
+      void scanForReplacementSellerTab().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     }
   });
 });
@@ -128,7 +127,16 @@ async function bindCurrentSellerTab(): Promise<OrderSyncState> {
     reloadRequested: true,
   });
   // Install the document_start identity and page proxy hooks on an already-open tab.
-  await chrome.tabs.reload(tab.id, { bypassCache: true });
+  try {
+    await chrome.tabs.reload(tab.id, { bypassCache: true });
+  } catch (error) {
+    await recordOrderSyncRuntimeLog('all', 'seller_bind_reload_failed', 'failed', 'Seller Center 页面刷新失败，尚未完成 Seller ID 捕获。', {
+      stage: 'seller_binding',
+      tabId: tab.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
   await recordOrderSyncRuntimeLog('all', 'seller_bind_reloaded', 'succeeded', 'Seller Center 页面已刷新，等待页面请求中的 Seller ID。', {
     stage: 'seller_binding',
     tabId: tab.id,
@@ -270,7 +278,7 @@ async function findReplacementSellerTab(
 async function scanForReplacementSellerTab(): Promise<void> {
   const current = await getOrderSyncState();
   if (!current.boundTab || current.boundTab.sellerId) {
-    await chrome.alarms.clear(SELLER_TAB_WATCH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
     return;
   }
 
@@ -359,7 +367,7 @@ async function ensureBoundSellerTabRefreshAlarm(): Promise<void> {
   const state = await getOrderSyncState();
   const tabId = state.boundTab?.tabId;
   if (tabId === undefined) {
-    await chrome.alarms.clear(SELLER_TAB_REFRESH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     return;
   }
 
@@ -367,17 +375,17 @@ async function ensureBoundSellerTabRefreshAlarm(): Promise<void> {
   try {
     tab = await chrome.tabs.get(tabId);
   } catch {
-    await chrome.alarms.clear(SELLER_TAB_REFRESH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     return;
   }
   if (tab.pinned !== true || !isSellerCenterUrl(tab.url) || isTikTokLoginPage(tab.url ?? '')) {
-    await chrome.alarms.clear(SELLER_TAB_REFRESH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     return;
   }
 
-  const existing = await chrome.alarms.get(SELLER_TAB_REFRESH_ALARM);
+  const existing = await chrome.alarms.get(SELLER_TAB_ALARMS.refresh);
   if (!existing) {
-    await chrome.alarms.create(SELLER_TAB_REFRESH_ALARM, {
+    await chrome.alarms.create(SELLER_TAB_ALARMS.refresh, {
       delayInMinutes: SELLER_TAB_REFRESH_DELAY_MINUTES,
     });
   }
@@ -386,13 +394,13 @@ async function ensureBoundSellerTabRefreshAlarm(): Promise<void> {
 async function ensureSellerBindingWatchAlarm(): Promise<void> {
   const state = await getOrderSyncState();
   if (!state.boundTab || state.boundTab.sellerId) {
-    await chrome.alarms.clear(SELLER_TAB_WATCH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
     return;
   }
 
-  const existing = await chrome.alarms.get(SELLER_TAB_WATCH_ALARM);
+  const existing = await chrome.alarms.get(SELLER_TAB_ALARMS.watch);
   if (!existing) {
-    await chrome.alarms.create(SELLER_TAB_WATCH_ALARM, {
+    await chrome.alarms.create(SELLER_TAB_ALARMS.watch, {
       delayInMinutes: SELLER_TAB_WATCH_DELAY_MINUTES,
     });
   }
@@ -402,7 +410,7 @@ async function refreshBoundSellerTab(): Promise<void> {
   const state = await getOrderSyncState();
   const boundTab = state.boundTab;
   if (!boundTab) {
-    await chrome.alarms.clear(SELLER_TAB_REFRESH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     return;
   }
 
@@ -410,7 +418,7 @@ async function refreshBoundSellerTab(): Promise<void> {
   try {
     tab = await chrome.tabs.get(boundTab.tabId);
   } catch {
-    await chrome.alarms.clear(SELLER_TAB_REFRESH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     await recordOrderSyncRuntimeLog('all', 'seller_tab_refresh_skipped', 'skipped', '绑定页面已不存在，跳过定时刷新。', {
       stage: 'seller_binding',
       tabId: boundTab.tabId,
@@ -420,7 +428,7 @@ async function refreshBoundSellerTab(): Promise<void> {
   }
 
   if (tab.pinned !== true || !isSellerCenterUrl(tab.url) || isTikTokLoginPage(tab.url ?? '')) {
-    await chrome.alarms.clear(SELLER_TAB_REFRESH_ALARM);
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     await recordOrderSyncRuntimeLog('all', 'seller_tab_refresh_skipped', 'skipped', '绑定页面未处于固定且已登录状态，跳过定时刷新。', {
       stage: 'seller_binding',
       tabId: boundTab.tabId,
@@ -450,8 +458,7 @@ async function refreshBoundSellerTab(): Promise<void> {
 async function clearOrderAlarms(): Promise<void> {
   await Promise.all([
     ...Object.values(ORDER_SYNC_ALARMS),
-    SELLER_TAB_REFRESH_ALARM,
-    SELLER_TAB_WATCH_ALARM,
+    ...Object.values(SELLER_TAB_ALARMS),
   ].map((name) => chrome.alarms.clear(name)));
 }
 
@@ -476,6 +483,11 @@ function isHttpUrl(value: string): boolean {
   catch { return false; }
 }
 
-function reportError(error: unknown): void {
+function reportError(error: unknown, source = 'background'): void {
   console.error('[order-data-sync]', error);
+  void recordOrderSyncRuntimeLog('all', 'background_error', 'failed', '后台事件处理异常。', {
+    stage: 'background',
+    source,
+    error: error instanceof Error ? error.message : String(error),
+  }).catch((loggingError) => console.error('[order-data-sync] log failure', loggingError));
 }
