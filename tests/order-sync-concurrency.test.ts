@@ -136,6 +136,20 @@ describe('order domain concurrent scope changes', () => {
       if (url.includes('logistic_detail')) {
         return new Promise((resolve) => { resolveLogistics = resolve; }) as never;
       }
+      if (url.includes('/api/fulfillment/order/get')) {
+        return pageResult({
+          code: 0,
+          message: 'success',
+          data: { main_order: [{ main_order_id: 'A-order-1' }] },
+        }) as never;
+      }
+      if (url.includes('/api/v1/fulfillment/order/history')) {
+        return pageResult({
+          code: 0,
+          message: 'success',
+          data: { total_count: 0, order_history: [] },
+        }) as never;
+      }
       return pageResult({
         code: 0,
         data: { main_orders: [{ main_order_id: 'A-order-1' }], has_more: false, total_count: 1 },

@@ -10,6 +10,7 @@ import {
   type OrderSyncSettings as OrderApiSettings,
 } from '../core/order-sync';
 import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryQuery, createOrderListRequestBody, tiktokOrderEndpointUrl } from '../core/tiktok-order-endpoints';
+import { OrderGetResponseSchema, OrderHistoryResponseSchema } from '../core/tiktok-order-endpoint-schemas';
 import { isCancelledTikTokOrderRow } from '../core/tiktok-order-status';
 import {
   createStatementListQuery,
@@ -2115,6 +2116,9 @@ async function processOrderDetailsBatch(
       const detailBusinessFailure = detailPayload === null
         ? null
         : tiktokBusinessFailure(detailPayload, '订单详情');
+      const detailSchemaResult = detailPayload === null
+        ? null
+        : OrderGetResponseSchema.safeParse(detailPayload);
       if (!detail.ok) {
         await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情响应失败。', {
           stage: 'order_detail',
@@ -2168,6 +2172,19 @@ async function processOrderDetailsBatch(
           ...orderTikTokResponseDiagnostics(detail),
         });
         attemptError = detailBusinessFailure;
+      } else if (!detailSchemaResult?.success) {
+        await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情响应结构校验失败。', {
+          stage: 'order_detail',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(detailUrl),
+          orderId,
+          failureReason: 'schema_validation',
+          schema: 'OrderGetResponseSchema',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', detailUrl, detailBody, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        attemptError = `订单详情响应 schema 校验失败：${detailSchemaResult?.error.message ?? 'unknown error'}`;
       } else {
         await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'succeeded', '订单详情响应已解析。', {
           stage: 'order_detail',
@@ -2420,7 +2437,7 @@ async function processOrderHistoryBatch(
         break;
       }
       const historyUrl = tiktokOrderEndpointUrl(
-        'https://seller.tiktokshopglobalselling.com',
+        origin,
         'order-history',
         { sellerId: boundTab.sellerId! },
         createOrderHistoryQuery(orderId),
@@ -2445,6 +2462,9 @@ async function processOrderHistoryBatch(
       const detailBusinessFailure = detailPayload === null
         ? null
         : tiktokBusinessFailure(detailPayload, '订单历史');
+      const detailSchemaResult = detailPayload === null
+        ? null
+        : OrderHistoryResponseSchema.safeParse(detailPayload);
       if (!detail.ok) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应失败。', {
           stage: 'order_history',
@@ -2498,6 +2518,19 @@ async function processOrderHistoryBatch(
           ...orderTikTokResponseDiagnostics(detail),
         });
         attemptError = detailBusinessFailure;
+      } else if (!detailSchemaResult?.success) {
+        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应结构校验失败。', {
+          stage: 'order_history',
+          method: 'GET',
+          endpoint: orderTikTokEndpointPath(historyUrl),
+          orderId,
+          failureReason: 'schema_validation',
+          schema: 'OrderHistoryResponseSchema',
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokResponseDiagnostics(detail),
+        });
+        attemptError = `订单历史响应 schema 校验失败：${detailSchemaResult?.error.message ?? 'unknown error'}`;
       } else {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'succeeded', '订单历史响应已解析。', {
           stage: 'order_history',

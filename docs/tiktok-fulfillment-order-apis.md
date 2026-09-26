@@ -4,13 +4,31 @@
 > 来源：seller.tiktokshopglobalselling.com 实际抓包  
 > 对应 Zod schema：`src/core/tiktok-order-endpoint-schemas.ts`
 
+## 0. 本次实际样本与 review 结论
+
+本次样本订单：`586172232072332674`，订单行：`586172232072398210`。
+
+两份 response 已按脱敏方式记录在本文对应章节中。
+
+样本校验结果：
+
+- `order/get`：`code=0`，`data.main_order` 有 1 条；`main_order_status=102`，同时存在 `reverse_module.reverse_status=4`，表示订单主体仍是有效订单但已进入退货/退款流程，不应按“已取消订单”跳过。
+- `order/history`：`code=0`，`total_count=7` 且返回 7 条事件，时间按倒序排列；退货申请事件包含 `detail`、`elements` 和 2 张证据图片。
+
+当前逻辑 review：
+
+1. 请求方法、路径、订单 ID 传递和成功业务码判断与样本一致。
+2. `main_order_status=104` 的取消订单过滤不会误伤本样本的售后订单，这一点符合当前 response。
+3. 生产链路现在会在上传前调用 `OrderGetResponseSchema` / `OrderHistoryResponseSchema`；结构异常但 HTTP 200、`code=0` 的 body 会进入失败队列，不会上传。
+4. 当前 URL builder 实际发送的公共参数是 `aid=6556`、`language=zh-CN`、`app_name=i18n_ecom_shop` 等；本文旧版抓包说明中的 `aid=4068` 已不再代表当前代码，以下请求说明按当前 builder 记录。
+
 ---
 
 ## 1. `api/fulfillment/order/get`（订单详情）
 
 - **Method**: `POST`
 - **URL**: `https://seller.tiktokshopglobalselling.com/api/fulfillment/order/get`
-- **Query params**: `aid=4068&locale=zh-CN&oec_seller_id={seller_id}&seller_id={seller_id}`
+- **Query params**: 当前 builder 会附带 `locale=zh-CN&language=zh-CN&aid=6556&app_name=i18n_ecom_shop&device_platform=web&cookie_enabled=true&oec_seller_id={seller_id}&seller_id={seller_id}`
 - **Body**: `{"main_order_id": ["<order_id_1>", "<order_id_2>", ...]}`
 
 ### 1.1 Response 结构
@@ -316,7 +334,7 @@
 
 - **Method**: `GET`
 - **URL**: `https://seller.tiktokshopglobalselling.com/api/v1/fulfillment/order/history`
-- **Query params**: `aid=4068&locale=zh-CN&oec_seller_id={seller_id}&seller_id={seller_id}&main_order_id={order_id}`
+- **Query params**: 当前 builder 会附带 `locale=zh-CN&language=zh-CN&aid=6556&app_name=i18n_ecom_shop&device_platform=web&cookie_enabled=true&oec_seller_id={seller_id}&seller_id={seller_id}&main_order_id={order_id}`
 
 ### 2.1 Response 结构
 
@@ -428,3 +446,7 @@
 | logistic_detail/list | `/api/v1/fulfillment/logistic_detail/list` | GET | 物流详情 | ✅ 已接入 |
 | **order/get** | `/api/fulfillment/order/get` | POST | **订单详情（含价格/退货/买家）** | ✅ 本次新增 |
 | **order/history** | `/api/v1/fulfillment/order/history` | GET | **订单状态时间线** | ✅ 本次新增 |
+
+## 4. 当前同步链路注意事项
+
+`order/get` 和 `order/history` 都是按订单逐条请求的 N+1 链路，订单 ID 来自 `order/list`，结果通过 `orders` domain 上传，后端再根据 endpoint 路径区分详情和历史。当前实现对请求异常、HTTP 非 2xx、登录失效、业务 `code != 0` 和 schema 校验失败均有处理；只有通过对应 schema 校验的成功 response 才会上传。`order/history` 使用绑定页面的 Seller Center 域名，避免不同 Seller Center 域名下请求来源不一致。

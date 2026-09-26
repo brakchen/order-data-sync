@@ -110,7 +110,11 @@ function stubFetch(orderIds: string[]): void {
     requestedMethods.push(init?.method ?? 'GET');
     const payload = url.includes('order_list') || url.includes('/order/list') || url.includes('order-list')
       ? { code: 0, data: { main_orders: orderIds.map((id) => ({ main_order_id: id })) } }
-      : { code: 0, data: { detail_for: url } };
+      : url.includes('/api/fulfillment/order/get')
+        ? { code: 0, message: 'success', data: { main_order: [{ main_order_id: url }] } }
+        : url.includes('/api/v1/fulfillment/order/history')
+          ? { code: 0, message: 'success', data: { total_count: 0, order_history: [] } }
+          : { code: 0, data: { detail_for: url } };
     return new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } });
   }));
 }
@@ -1557,6 +1561,127 @@ describe('物流域（N+1，逐单详情）', () => {
     await running;
 
     expect(mocks.uploadDump).not.toHaveBeenCalled();
+  });
+});
+
+describe('订单详情与历史域（N+1，逐单接口）', () => {
+  it('order/get 的 HTTP 200 + code=0 但结构无效时不上传', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      requested.push(url);
+      requestedMethods.push(init?.method ?? 'GET');
+      if (url.includes('/api/fulfillment/order/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: { main_orders: [{ main_order_id: 'o1' }], has_more: false, total_count: 1 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ code: 0, message: 'success', data: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }));
+
+    await pollOrderDomain('order_details');
+
+    expect(requestedMethods).toEqual(['POST', 'POST']);
+    expect(mocks.uploadDump).not.toHaveBeenCalled();
+    expect(state.orderProgress?.domains.order_details).toMatchObject({
+      pending: 1,
+      failed: 1,
+      failedOrderIds: ['o1'],
+    });
+    expect(state.orderProgress?.domains.order_details.lastError).toContain('schema 校验失败');
+    expect(state.runtimeLogs.some((log) => log.context?.event === 'tiktok_request'
+      && log.context?.details?.stage === 'order_detail'
+      && log.context?.details?.failureReason === 'schema_validation')).toBe(true);
+  });
+
+  it('order/get 结构有效时上传详情', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      requested.push(url);
+      requestedMethods.push(init?.method ?? 'GET');
+      if (url.includes('/api/fulfillment/order/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: { main_orders: [{ main_order_id: 'o1' }], has_more: false, total_count: 1 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data: { main_order: [{ main_order_id: 'o1' }] },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await pollOrderDomain('order_details');
+
+    expect(mocks.uploadDump).toHaveBeenCalledOnce();
+    expect((mocks.uploadDump.mock.calls[0]![2] as { endpoint: string }).endpoint)
+      .toContain('/api/fulfillment/order/get');
+    expect(requestedMethods).toEqual(['POST', 'POST']);
+  });
+
+  it('order/history 的 HTTP 200 + code=0 但结构无效时不上传', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      requested.push(url);
+      requestedMethods.push(init?.method ?? 'GET');
+      if (url.includes('/api/fulfillment/order/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: { main_orders: [{ main_order_id: 'o1' }], has_more: false, total_count: 1 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ code: 0, message: 'success', data: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }));
+
+    await pollOrderDomain('order_history');
+
+    expect(requested[1]).toContain('https://seller.tiktokglobalshop.com/');
+    expect(requestedMethods).toEqual(['POST', 'GET']);
+    expect(mocks.uploadDump).not.toHaveBeenCalled();
+    expect(state.orderProgress?.domains.order_history).toMatchObject({
+      pending: 1,
+      failed: 1,
+      failedOrderIds: ['o1'],
+    });
+    expect(state.orderProgress?.domains.order_history.lastError).toContain('schema 校验失败');
+    expect(state.runtimeLogs.some((log) => log.context?.event === 'tiktok_request'
+      && log.context?.details?.stage === 'order_history'
+      && log.context?.details?.failureReason === 'schema_validation')).toBe(true);
+  });
+
+  it('order/history 结构有效时上传历史', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes('/api/fulfillment/order/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: { main_orders: [{ main_order_id: 'o1' }], has_more: false, total_count: 1 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data: { total_count: 0, order_history: [] },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await pollOrderDomain('order_history');
+
+    expect(mocks.uploadDump).toHaveBeenCalledOnce();
+    expect((mocks.uploadDump.mock.calls[0]![2] as { endpoint: string }).endpoint)
+      .toContain('/api/v1/fulfillment/order/history');
   });
 });
 
