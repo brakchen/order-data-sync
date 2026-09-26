@@ -12,6 +12,8 @@
 export const TIKTOK_ORDER_ENDPOINT_PATHS = {
   'order-list': '/api/fulfillment/order/list',
   'logistic-detail': '/api/v1/fulfillment/logistic_detail/list',
+  'order-get': '/api/fulfillment/order/get',
+  'order-history': '/api/v1/fulfillment/order/history',
 } as const;
 
 export type TikTokOrderEndpointKind = keyof typeof TIKTOK_ORDER_ENDPOINT_PATHS;
@@ -72,5 +74,15 @@ export function createOrderListRequestBody(input: {
 
 /** Query params for logistic_detail/list (GET — no body). */
 export function createLogisticDetailQuery(mainOrderId: string): Record<string, string> {
+  return { main_order_id: mainOrderId };
+}
+
+/** POST body for order/get. Accepts an array of main_order_id strings. */
+export function createOrderGetRequestBody(mainOrderIds: string[]): Record<string, unknown> {
+  return { main_order_id: mainOrderIds };
+}
+
+/** Query params for order/history (GET — no body). */
+export function createOrderHistoryQuery(mainOrderId: string): Record<string, string> {
   return { main_order_id: mainOrderId };
 }
