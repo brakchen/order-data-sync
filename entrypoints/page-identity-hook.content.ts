@@ -7,6 +7,7 @@ import {
   ORDER_PAGE_PROXY_CANCEL,
   ORDER_PAGE_PROXY_REQUEST,
   ORDER_PAGE_PROXY_RESPONSE,
+  ORDER_PAGE_PROXY_READY,
   ORDER_PAGE_PROXY_SOURCE,
   PAGE_PROXY_READY_FLAG,
 } from '../src/extension/page-request-protocol';
@@ -39,6 +40,7 @@ export default defineContentScript({
       installIdentityHooks();
     }
     installPageProxy();
+    window.postMessage({ source: ORDER_PAGE_PROXY_SOURCE, type: ORDER_PAGE_PROXY_READY }, '*');
   },
 });
 
@@ -54,8 +56,10 @@ function installIdentityHooks(): void {
       if (!sellerId) return;
       const key = `${url.origin}|${url.pathname}|${sellerId}`;
       if (seen.has(key)) return;
+      // Deduplicate consecutive observations, but allow A -> B -> A when the
+      // user switches shops in the same Seller Center tab.
+      seen.clear();
       seen.add(key);
-      if (seen.size > 64) seen.delete(seen.values().next().value!);
       window.postMessage({
         source: ORDER_IDENTITY_SOURCE,
         type: 'seller-observed',

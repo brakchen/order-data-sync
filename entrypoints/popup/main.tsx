@@ -16,18 +16,18 @@ function Popup() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
 
-  const refresh = async () => {
+  const refresh = async (updateDraft = false) => {
     try {
       const result = await send<OrderSyncState>({ type: 'order-sync:get-state' });
       setState(result);
-      setDraft(result.settings);
+      if (updateDraft) setDraft(result.settings);
     } catch (error) {
       setNotice(toMessage(error));
     }
   };
 
   useEffect(() => {
-    void refresh();
+    void refresh(true);
     const changed = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
       if (area === 'local' && changes.orderSyncState) void refresh();
     };
@@ -35,13 +35,17 @@ function Popup() {
     return () => chrome.storage.onChanged.removeListener(changed);
   }, []);
 
-  const run = async (action: () => Promise<OrderSyncState>, success: string) => {
+  const run = async (
+    action: () => Promise<OrderSyncState>,
+    success: string,
+    updateDraft = false,
+  ) => {
     setBusy(true);
     setNotice('');
     try {
       const next = await action();
       setState(next);
-      setDraft(next.settings);
+      if (updateDraft) setDraft(next.settings);
       setNotice(success);
     } catch (error) {
       setNotice(toMessage(error));
@@ -53,6 +57,7 @@ function Popup() {
   const save = () => run(
     () => send<OrderSyncState>({ type: 'order-sync:save-settings', settings: draft }),
     '配置已保存。',
+    true,
   );
   const toggleBinding = () => state?.boundTab
     ? run(() => send<OrderSyncState>({ type: 'order-sync:unbind-tab' }), '已解绑 Seller Center 页面。')

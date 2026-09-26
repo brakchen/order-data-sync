@@ -5,6 +5,8 @@ export const ORDER_PAGE_PROXY_SOURCE = 'tiktok-order-sync-page-proxy-v1';
 export const ORDER_PAGE_PROXY_REQUEST = 'request';
 export const ORDER_PAGE_PROXY_RESPONSE = 'response';
 export const ORDER_PAGE_PROXY_CANCEL = 'cancel';
+export const ORDER_PAGE_PROXY_READY = 'ready';
+// MAIN-world guard only; isolated content scripts use ORDER_PAGE_PROXY_READY.
 export const PAGE_PROXY_READY_FLAG = '__tiktokOrderSyncPageProxyReadyV1';
 export const ORDER_IDENTITY_SOURCE = 'tiktok-order-sync-identity-v1';
 

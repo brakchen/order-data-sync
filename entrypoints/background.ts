@@ -58,7 +58,8 @@ export async function handleOrderMessage(
       if (settings.syncBaseUrl && !isHttpUrl(settings.syncBaseUrl)) throw new Error('同步地址必须是有效的 HTTP(S) URL。');
       const next = await mutateOrderSyncState((current) => {
         const destinationChanged = normalizeOrderSyncBaseUrl(current.settings.syncBaseUrl)
-          !== normalizeOrderSyncBaseUrl(settings.syncBaseUrl);
+          !== normalizeOrderSyncBaseUrl(settings.syncBaseUrl)
+          || current.settings.syncToken.trim() !== settings.syncToken.trim();
         return {
           ...current,
           settings,
@@ -122,13 +123,14 @@ async function captureSellerIdentity(
   if (senderTabId === undefined || !isSellerCenterUrl(payload.url) || !payload.sellerId.trim()) return getOrderSyncState();
   const next = await mutateOrderSyncState((current) => {
     if (current.boundTab?.tabId !== senderTabId) return current;
-    const sellerChanged = current.boundTab.sellerId !== payload.sellerId;
+    const sellerId = payload.sellerId.trim();
+    const sellerChanged = current.boundTab.sellerId !== sellerId;
     return {
       ...current,
       boundTab: {
         ...current.boundTab,
         url: payload.url,
-        sellerId: payload.sellerId.trim(),
+        sellerId,
         ...(payload.advertiserId ? { advertiserId: payload.advertiserId } : {}),
       },
       ...(sellerChanged ? {

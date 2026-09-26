@@ -33,7 +33,7 @@ import type {
   OrderSyncTrigger,
 } from '../core/types';
 import { fetchTikTokResponse, type BoundTikTokResponse } from './tiktok-page-response';
-import { PAGE_PROXY_READY_FLAG, type PageProxyRequestPayload } from './page-request-protocol';
+import type { PageProxyRequestPayload } from './page-request-protocol';
 import {
   createDefaultOrderProgress,
   getOrderSyncState,
@@ -2124,7 +2124,7 @@ const stoppedOrderRunIds = new Set<string>();
 
 let manualOrderDomainSyncRequested = false;
 
-let initialOrderDomainSyncStarted = false;
+let initialOrderDomainSyncStartedFor: string | null = null;
 
 
 /**
@@ -3265,7 +3265,6 @@ export async function runInitialOrderDomainSync(
 
 
 async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger): Promise<void> {
-  if (initialOrderDomainSyncStarted) return;
   const state = await orderPollingState();
   if (!state) return;
   // MV3 service workers can restart many times per day. An in-memory "started"
@@ -3273,7 +3272,14 @@ async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger
   // store that has never recorded an order-domain run. Daily alarms and saved
   // checkpoints handle all subsequent startup/resume cases.
   if (state.orderProgress?.lastRunAt) return;
-  initialOrderDomainSyncStarted = true;
+  const scope = [
+    state.boundTab?.tabId ?? '',
+    state.boundTab?.sellerId ?? '',
+    normaliseOrderSyncBaseUrl(state.settings.syncBaseUrl),
+    state.settings.syncToken.trim(),
+  ].join('|');
+  if (initialOrderDomainSyncStartedFor === scope) return;
+  initialOrderDomainSyncStartedFor = scope;
   // The run records its own failure event. Keep this detached task from
   // becoming an unhandled rejection if the worker is shutting down.
   void runInitialOrderDomainSync(trigger).catch(() => undefined);

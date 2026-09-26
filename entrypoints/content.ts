@@ -6,8 +6,8 @@ import {
   ORDER_PAGE_PROXY_CANCEL,
   ORDER_PAGE_PROXY_REQUEST,
   ORDER_PAGE_PROXY_RESPONSE,
+  ORDER_PAGE_PROXY_READY,
   ORDER_PAGE_PROXY_SOURCE,
-  PAGE_PROXY_READY_FLAG,
   ORDER_IDENTITY_SOURCE,
 } from '../src/extension/page-request-protocol';
 
@@ -19,6 +19,14 @@ export default defineContentScript({
   ],
   runAt: 'document_start',
   main() {
+    let pageProxyReady = false;
+    window.addEventListener('message', (event) => {
+      if (event.source === window && isRecord(event.data)
+        && event.data.source === ORDER_PAGE_PROXY_SOURCE
+        && event.data.type === ORDER_PAGE_PROXY_READY) {
+        pageProxyReady = true;
+      }
+    });
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const value = message as { type?: unknown; payload?: unknown } | undefined;
       if (value?.type === 'order-sync:page-cancel' && isPageProxyCancelPayload(value.payload)) {
@@ -26,7 +34,7 @@ export default defineContentScript({
         return false;
       }
       if (value?.type !== 'order-sync:page-request' || !isPageProxyRequestPayload(value.payload)) return false;
-      if (!(window as unknown as Record<string, boolean>)[PAGE_PROXY_READY_FLAG]) {
+      if (!pageProxyReady) {
         sendResponse({ ok: false, errorName: 'PageProxyUnavailableError', errorMessage: '订单插件页面代理尚未就绪。' });
         return false;
       }
