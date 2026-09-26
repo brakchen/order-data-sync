@@ -46,8 +46,7 @@ export default defineBackground(() => {
     }
   });
 
-  void getOrderSyncState().catch((error) => reportError(error, 'extension_startup'));
-  void ensureBoundAlarms('extension_startup').catch(reportSchedulerError);
+  void initializeBackground().catch((error) => reportError(error, 'extension_startup'));
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ORDER_SYNC_ALARMS.orders || alarm.name === ORDER_SYNC_ALARMS.ordersContinue) {
       void handleOrderSyncAlarm().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
@@ -55,6 +54,10 @@ export default defineBackground(() => {
       void pollOrderDomain('logistics').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.statements || alarm.name === ORDER_SYNC_ALARMS.statementsContinue) {
       void pollOrderDomain('statements').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
+    } else if (alarm.name === ORDER_SYNC_ALARMS.order_details || alarm.name === ORDER_SYNC_ALARMS.orderDetailsContinue) {
+      void pollOrderDomain('order_details').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
+    } else if (alarm.name === ORDER_SYNC_ALARMS.order_history || alarm.name === ORDER_SYNC_ALARMS.orderHistoryContinue) {
+      void pollOrderDomain('order_history').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === SELLER_TAB_ALARMS.refresh) {
       void refreshBoundSellerTab().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === SELLER_TAB_ALARMS.watch) {
@@ -62,6 +65,66 @@ export default defineBackground(() => {
     }
   });
 });
+
+async function initializeBackground(): Promise<void> {
+  await recoverSellerBindingOnStartup();
+  await ensureBoundAlarms('extension_startup');
+}
+
+async function recoverSellerBindingOnStartup(): Promise<void> {
+  const current = await getOrderSyncState();
+  if (current.sellerBinding.mode === 'auto') {
+    const deadlineAt = Date.parse(current.sellerBinding.deadlineAt ?? '');
+    if (current.settings.syncToken.trim() && Number.isFinite(deadlineAt) && deadlineAt > Date.now()) {
+      await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_resumed', 'recorded', '后台重新启动，已恢复未完成的自动绑定流程。', {
+        stage: 'seller_binding',
+        deadlineAt: new Date(deadlineAt).toISOString(),
+        remainingMs: Math.max(0, deadlineAt - Date.now()),
+        preservedBoundTab: Boolean(current.boundTab),
+      });
+      void startAutomaticSellerBinding(deadlineAt).catch((error) => reportError(error, 'auto_bind_resume'));
+      return;
+    }
+    const hasSellerId = Boolean(current.boundTab?.sellerId);
+    await mutateOrderSyncState((state) => state.sellerBinding.mode === 'auto'
+      ? {
+        ...state,
+        boundTab: hasSellerId ? state.boundTab : null,
+        sellerBinding: {
+          mode: 'idle',
+          outcome: hasSellerId ? 'bound' : 'timeout',
+          deadlineAt: null,
+        },
+      }
+      : state);
+    await recordOrderSyncRuntimeLog('all', 'seller_binding_recovered', 'recorded', '后台重新启动，已释放遗留的自动绑定状态。', {
+      stage: 'seller_binding',
+      previousMode: 'auto',
+      reason: current.settings.syncToken.trim() ? 'deadline_expired' : 'token_missing',
+      preservedSellerId: hasSellerId,
+    });
+    return;
+  }
+
+  if (current.sellerBinding.mode === 'manual') {
+    const hasSellerId = Boolean(current.boundTab?.sellerId);
+    await mutateOrderSyncState((state) => state.sellerBinding.mode === 'manual'
+      ? {
+        ...state,
+        sellerBinding: {
+          mode: 'idle',
+          outcome: hasSellerId ? 'bound' : 'none',
+          deadlineAt: null,
+        },
+      }
+      : state);
+    await recordOrderSyncRuntimeLog('all', 'seller_binding_recovered', 'recorded', '后台重新启动，已释放遗留的手动绑定状态。', {
+      stage: 'seller_binding',
+      previousMode: 'manual',
+      preservedSellerId: hasSellerId,
+    });
+  }
+}
 
 export async function handleOrderMessage(
   message: OrderExtensionMessage,
@@ -275,10 +338,10 @@ async function captureSellerIdentity(
   return next;
 }
 
-async function startAutomaticSellerBinding(): Promise<void> {
+async function startAutomaticSellerBinding(deadlineAtMs?: number): Promise<void> {
   if (autoBindingPromise) return autoBindingPromise;
   const runId = ++autoBindingRunId;
-  const promise = runAutomaticSellerBinding(runId);
+  const promise = runAutomaticSellerBinding(runId, deadlineAtMs);
   let trackedPromise: Promise<void>;
   trackedPromise = promise.finally(() => {
     if (autoBindingPromise === trackedPromise) autoBindingPromise = null;
@@ -287,10 +350,14 @@ async function startAutomaticSellerBinding(): Promise<void> {
   return trackedPromise;
 }
 
-async function runAutomaticSellerBinding(runId: number): Promise<void> {
-  const deadlineAt = Date.now() + AUTO_BIND_TIMEOUT_MS;
+async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: number): Promise<void> {
+  const deadlineAt = Number.isFinite(requestedDeadlineAt) && requestedDeadlineAt! > Date.now()
+    ? requestedDeadlineAt!
+    : Date.now() + AUTO_BIND_TIMEOUT_MS;
   const activated = await mutateOrderSyncState((current) => {
-    if (runId !== autoBindingRunId || current.boundTab || current.sellerBinding.mode !== 'idle') return current;
+    if (runId !== autoBindingRunId
+      || (current.sellerBinding.mode !== 'idle' && current.sellerBinding.mode !== 'auto')
+      || (current.boundTab?.sellerId ?? '') !== '') return current;
     return {
       ...current,
       sellerBinding: {
@@ -311,7 +378,30 @@ async function runAutomaticSellerBinding(runId: number): Promise<void> {
 
   let lastSearchError: string | null = null;
   let searchErrorLogged = false;
+  let candidateFound = Boolean(activated.boundTab);
   while (Date.now() < deadlineAt && runId === autoBindingRunId) {
+    const bindingState = await getOrderSyncState();
+    if (bindingState.sellerBinding.mode !== 'auto') return;
+    if (bindingState.boundTab?.sellerId) {
+      await mutateOrderSyncState((current) => current.sellerBinding.mode === 'auto'
+        ? {
+          ...current,
+          sellerBinding: { mode: 'idle', outcome: 'bound', deadlineAt: null },
+        }
+        : current);
+      await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_completed', 'succeeded', '自动绑定已完成，并成功捕获 Seller ID。', {
+        stage: 'seller_binding',
+        candidateFound,
+        sellerIdCaptured: true,
+      });
+      return;
+    }
+    if (bindingState.boundTab) {
+      candidateFound = true;
+      await new Promise((resolve) => setTimeout(resolve, AUTO_BIND_POLL_INTERVAL_MS));
+      continue;
+    }
+
     let candidate: chrome.tabs.Tab | null = null;
     try {
       candidate = await findAutomaticSellerTab();
@@ -329,20 +419,20 @@ async function runAutomaticSellerBinding(runId: number): Promise<void> {
     if (candidate?.id !== undefined && candidate.url) {
       try {
         await autoBindInitialSellerTab(candidate);
-        await mutateOrderSyncState((current) => current.sellerBinding.mode === 'auto'
-          ? {
-            ...current,
-            sellerBinding: { mode: 'idle', outcome: 'bound', deadlineAt: null },
-          }
-          : current);
-        return;
+        candidateFound = true;
+        continue;
       } catch (error) {
-        await mutateOrderSyncState((current) => current.sellerBinding.mode === 'auto'
-          ? {
+        let recovered = false;
+        await mutateOrderSyncState((current) => {
+          if (current.sellerBinding.mode !== 'auto') return current;
+          recovered = true;
+          return {
             ...current,
+            boundTab: current.boundTab?.sellerId ? current.boundTab : null,
             sellerBinding: { mode: 'idle', outcome: 'failed', deadlineAt: null },
-          }
-          : current);
+          };
+        });
+        if (recovered) await ensureBoundAlarms('configuration_ready');
         await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_failed', 'failed', '自动绑定 Seller Center 页面失败，已恢复手动绑定。', {
           stage: 'seller_binding',
           tabId: candidate.id,
@@ -355,16 +445,29 @@ async function runAutomaticSellerBinding(runId: number): Promise<void> {
   }
 
   if (runId !== autoBindingRunId) return;
-  await mutateOrderSyncState((current) => current.sellerBinding.mode === 'auto'
-    ? {
+  let timedOut = false;
+  let sellerIdCapturedAtTimeout = false;
+  await mutateOrderSyncState((current) => {
+    if (current.sellerBinding.mode !== 'auto') return current;
+    timedOut = true;
+    const sellerCaptured = Boolean(current.boundTab?.sellerId);
+    sellerIdCapturedAtTimeout = sellerCaptured;
+    return {
       ...current,
-      sellerBinding: { mode: 'idle', outcome: 'timeout', deadlineAt: null },
-    }
-    : current);
+      boundTab: sellerCaptured ? current.boundTab : null,
+      sellerBinding: {
+        mode: 'idle',
+        outcome: sellerCaptured ? 'bound' : 'timeout',
+        deadlineAt: null,
+      },
+    };
+  });
+  if (timedOut) await ensureBoundAlarms('configuration_ready');
   await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_timeout', 'skipped', '自动绑定 Seller Center 页面超过 10 秒未完成，已恢复手动绑定。', {
     stage: 'seller_binding',
     timeoutMs: AUTO_BIND_TIMEOUT_MS,
-    candidateFound: false,
+    candidateFound,
+    sellerIdCaptured: sellerIdCapturedAtTimeout,
     lastSearchError,
   });
 }
@@ -463,7 +566,8 @@ async function findReplacementSellerTab(
     .filter((tab) => tab.id !== undefined && tab.id !== excludedTabId && isSellerCenterUrl(tab.url)
       && !isTikTokLoginPage(tab.url ?? '')
       && new URL(tab.url!).origin === previousOrigin)
-    .sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active))
+    .sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned))
+      || Number(Boolean(right.active)) - Number(Boolean(left.active))
       || (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0] ?? null;
 }
 
@@ -510,7 +614,7 @@ async function autoRebindSellerTab(
       boundAt: new Date().toISOString(),
     },
   }));
-  await pinSellerTab(tabId, 'auto_rebind');
+  if (replacement.pinned !== true) await pinSellerTab(tabId, 'auto_rebind');
   await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_requested', 'started', '已自动切换到同域名 Seller Center 页面。', {
     stage: 'seller_binding',
     reason,

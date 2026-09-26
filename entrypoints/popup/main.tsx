@@ -210,11 +210,20 @@ function formatTime(value: string): string {
 function formatNextSync(state: OrderSyncState | null): string {
   if (!state) return '加载中…';
   if (state.orderProgress.status === 'running') return '同步进行中';
-  const nextSyncAt = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const)
-    .map((domain) => state.orderProgress.domains[domain].nextSyncAt)
+  const rows = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const)
+    .map((domain) => state.orderProgress.domains[domain]);
+  if (rows.some((row) => (row.pending ?? 0) > 0
+    || (row.failed ?? 0) > 0
+    || row.currentOrderId != null
+    || row.resumeOrderId != null
+    || row.syncRunStatus === 'interrupted')) return '等待续传';
+  if (state.settings.syncPaused || !state.settings.orderDomainSyncEnabled) return '已暂停';
+  const nextSyncAt = rows
+    .map((row) => row.nextSyncAt)
     .filter((value): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)))
     .sort((left, right) => Date.parse(left) - Date.parse(right))[0];
   if (nextSyncAt) return formatTime(nextSyncAt);
+  if (rows.some((row) => row.lastError != null || row.syncRunStatus === 'partial_failed')) return '等待重试';
   if (!state.boundTab?.sellerId || !state.settings.syncToken.trim()) return '等待配置';
   return '首次同步准备中';
 }

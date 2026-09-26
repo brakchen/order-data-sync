@@ -2918,6 +2918,7 @@ const stoppedOrderRunIds = new Set<string>();
 let manualOrderDomainSyncRequested = false;
 
 let initialOrderDomainSyncStartedFor: string | null = null;
+let initialOrderDomainSyncPromise: Promise<void> | null = null;
 
 
 /**
@@ -4281,6 +4282,7 @@ async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger
   // store that has never recorded an order-domain run. Daily alarms and saved
   // checkpoints handle all subsequent startup/resume cases.
   if (state.orderProgress?.lastRunAt) return;
+  if (initialOrderDomainSyncPromise) return;
   const scope = [
     state.boundTab?.tabId ?? '',
     state.boundTab?.sellerId ?? '',
@@ -4291,7 +4293,13 @@ async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger
   initialOrderDomainSyncStartedFor = scope;
   // The run records its own failure event. Keep this detached task from
   // becoming an unhandled rejection if the worker is shutting down.
-  void runInitialOrderDomainSync(trigger).catch(() => undefined);
+  const run = runInitialOrderDomainSync(trigger);
+  let trackedRun: Promise<void>;
+  trackedRun = run.finally(() => {
+    if (initialOrderDomainSyncPromise === trackedRun) initialOrderDomainSyncPromise = null;
+  });
+  initialOrderDomainSyncPromise = trackedRun;
+  void trackedRun.catch(() => undefined);
 }
 
 
@@ -4327,7 +4335,8 @@ async function ensureBoundAlarm(
   }
   const existing = await chrome.alarms.get(name);
   // 兼容旧版本遗留的周期 alarm：发现周期 alarm 时重建为一次性 alarm。
-  if (existing?.periodInMinutes !== undefined) {
+  const legacyPeriodicAlarm = existing?.periodInMinutes !== undefined;
+  if (legacyPeriodicAlarm) {
     if (typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(name);
   }
   // 正在处理的批次会在 finally 前安排续传或下一整轮。心跳在此时创建
@@ -4346,7 +4355,8 @@ async function ensureBoundAlarm(
     return;
   }
   const nextSyncAt = Date.parse(row?.nextSyncAt ?? '');
-  if (existing && (!Number.isFinite(nextSyncAt) || Math.abs(existing.scheduledTime - nextSyncAt) < 60_000)) return;
+  if (!legacyPeriodicAlarm && existing
+    && (!Number.isFinite(nextSyncAt) || Math.abs(existing.scheduledTime - nextSyncAt) < 60_000)) return;
   if (existing && typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(name);
   await chrome.alarms.create(name, Number.isFinite(nextSyncAt)
     ? { when: Math.max(Date.now() + 1_000, nextSyncAt) }
