@@ -84,7 +84,6 @@ function Popup() {
     success,
     true,
   );
-  const save = () => saveDraftSettings(draft, '配置已保存。');
   useEffect(() => {
     if (!settingsInitialized.current) return undefined;
     const serialized = serializeSettings(draft);
@@ -142,7 +141,7 @@ function Popup() {
       </header>
 
       <section className="card">
-        <h2>下游配置</h2>
+        <div className="section-title"><h2>下游配置</h2><span className="caption">自动保存</span></div>
         <label>同步地址
           <input type="url" value={draft.syncBaseUrl} placeholder="https://example.com/tts"
             onChange={(event) => updateDraft({ ...draft, syncBaseUrl: event.target.value })} />
@@ -157,7 +156,6 @@ function Popup() {
             onChange={(event) => updateDraft({ ...draft, orderDomainSyncEnabled: !event.target.checked })} />
           <span>暂停自动采集</span>
         </label>
-        <button className="secondary" disabled={busy} onClick={() => void save()}>保存配置</button>
       </section>
 
       <section className="card binding-card">
@@ -176,7 +174,7 @@ function Popup() {
         {state?.endpointCircuit ? <div className="critical-alert" role="alert">
           <strong>同步已暂停：TikTok 接口持续报错</strong>
           <span>{state.endpointCircuit.endpoint} · HTTP {state.endpointCircuit.httpStatus} · 连续 {state.endpointCircuit.consecutiveFailures} 次</span>
-          <small>已停止继续请求和上传 TTS-ERP，请人工排查接口后取消暂停并保存配置。</small>
+          <small>已停止继续请求和上传 TTS-ERP，请人工排查接口后取消暂停；配置会自动保存。</small>
         </div> : null}
         <div className="next-sync"><span>下次同步</span><strong>{formatNextSync(state)}</strong></div>
         <div className="sync-actions">
