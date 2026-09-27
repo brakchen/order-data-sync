@@ -50,6 +50,10 @@ import {
 
 type OrderPollingDomain = OrderDomainKey;
 const ORDER_PAGE_REQUEST_TIMEOUT_MS = 30_000;
+// Single-order endpoints can take substantially longer than list pages when
+// Seller Center is under load. Keep the list timeout unchanged, but give
+// detail/history requests enough time to finish before retrying the item.
+const ORDER_ITEM_REQUEST_TIMEOUT_MS = 60_000;
 const SELLER_IDENTITY_PROBE_TIMEOUT_MS = 2_500;
 const MAX_RUNTIME_LOGS = 5_000;
 export const ORDER_SYNC_ALARMS = {
@@ -626,6 +630,10 @@ function orderRequestExceptionDetails(error: unknown): Record<string, unknown> {
   };
   if (!isRecord(error)) return details;
   if (typeof error.code === 'string') details.syncErrorCode = error.code.slice(0, 64);
+  if (typeof error.timeoutMs === 'number' && Number.isFinite(error.timeoutMs)) {
+    details.timeoutMs = error.timeoutMs;
+    details.transportFailure = 'timeout';
+  }
   if (typeof error.httpStatus === 'number' && Number.isFinite(error.httpStatus)) details.httpStatus = error.httpStatus;
   if (typeof error.operation === 'string') details.operation = error.operation.slice(0, 64);
   if (error.operation === 'dump') {
@@ -1912,7 +1920,9 @@ async function processLogisticsBatch(
       const requestStartedAt = Date.now();
       let detail: BoundTikTokResponse;
       try {
-        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, detailUrl, {}, 'GET');
+        detail = await executeTikTokRequestWithTimeout(
+          boundTab.tabId, detailUrl, {}, 'GET', ORDER_ITEM_REQUEST_TIMEOUT_MS,
+        );
       } catch (error) {
         await recordOrderSyncRuntimeLog('logistics', 'tiktok_request', 'failed', '物流详情请求异常。', {
           stage: 'logistics_detail',
@@ -2244,7 +2254,9 @@ async function processOrderDetailsBatch(
       const requestStartedAt = Date.now();
       let detail: BoundTikTokResponse;
       try {
-        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, detailUrl, detailBody, 'POST');
+        detail = await executeTikTokRequestWithTimeout(
+          boundTab.tabId, detailUrl, detailBody, 'POST', ORDER_ITEM_REQUEST_TIMEOUT_MS,
+        );
       } catch (error) {
         await recordOrderSyncRuntimeLog('order_details', 'tiktok_request', 'failed', '订单详情请求异常。', {
           stage: 'order_detail',
@@ -2591,7 +2603,9 @@ async function processOrderHistoryBatch(
       const requestStartedAt = Date.now();
       let detail: BoundTikTokResponse;
       try {
-        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, historyUrl, historyBody, 'POST');
+        detail = await executeTikTokRequestWithTimeout(
+          boundTab.tabId, historyUrl, historyBody, 'POST', ORDER_ITEM_REQUEST_TIMEOUT_MS,
+        );
       } catch (error) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史请求异常。', {
           stage: 'order_history',
@@ -4189,7 +4203,9 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
           const requestStartedAt = Date.now();
           let detail: BoundTikTokResponse;
           try {
-            detail = await executeTikTokRequestWithTimeout(boundTab.tabId, detailUrl, {}, 'GET');
+            detail = await executeTikTokRequestWithTimeout(
+              boundTab.tabId, detailUrl, {}, 'GET', ORDER_ITEM_REQUEST_TIMEOUT_MS,
+            );
           } catch (error) {
             await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'failed', '结算明细请求异常。', {
               stage: 'statement_detail',
@@ -4662,12 +4678,24 @@ async function executeTikTokRequestWithTimeout(
   assertTikTokEndpointCircuitClosed(url);
   const controller = new AbortController();
   const release = await tiktokRequestPacer().acquire(controller.signal);
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     assertTikTokEndpointCircuitClosed(url);
     const response = await executeTikTokRequestInBoundPage(tabId, url, body, controller.signal, method, crypto.randomUUID(), timeoutMs);
     await noteTikTokEndpointResponse(url, response);
     return response;
+  } catch (error) {
+    if (timedOut && error instanceof DOMException && error.name === 'AbortError') {
+      throw Object.assign(new Error(`Seller Center 页面请求超过 ${timeoutMs}ms 未完成。`), {
+        name: 'TikTokRequestTimeoutError',
+        timeoutMs,
+      });
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
     release();
