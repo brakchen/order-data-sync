@@ -16,6 +16,7 @@ export interface SellerPageRefreshDecision {
   pageAgeMs: number;
   retryAfterMs: number;
   activeRequestCount: number;
+  claimUntil?: number;
 }
 
 /** Atomically checks shared page activity and claims the next reload task. */
@@ -69,10 +70,27 @@ export function claimSellerPageRefresh(
       return { allowed: false, reason: 'page_recently_loaded', pageAgeMs,
         retryAfterMs: minimumPageAgeMs - pageAgeMs, activeRequestCount: 0 };
     }
-    persist(now + claimMs);
+    const claimUntil = now + claimMs;
+    persist(claimUntil);
     return { allowed: true, reason: 'allowed', pageAgeMs,
-      retryAfterMs: minimumPageAgeMs, activeRequestCount: 0 };
+      retryAfterMs: minimumPageAgeMs, activeRequestCount: 0, claimUntil };
   } catch {
     return unavailable();
+  }
+}
+
+export function releaseSellerPageRefreshClaim(storageKey: string, expectedClaimUntil: number): void {
+  if (!Number.isFinite(expectedClaimUntil) || expectedClaimUntil <= 0) return;
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(storageKey) ?? '{}') as Partial<SellerPageCoordinationState>;
+    if (parsed.refreshClaimUntil !== expectedClaimUntil) return;
+    window.localStorage.setItem(storageKey, JSON.stringify({
+      activeRequests: typeof parsed.activeRequests === 'object' && parsed.activeRequests !== null
+        ? parsed.activeRequests : {},
+      lastActivityAt: typeof parsed.lastActivityAt === 'number' ? parsed.lastActivityAt : 0,
+      refreshClaimUntil: 0,
+    } satisfies SellerPageCoordinationState));
+  } catch {
+    // The lease expires automatically if page storage is unavailable.
   }
 }
