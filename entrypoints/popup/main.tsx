@@ -11,6 +11,17 @@ const DOMAIN_LABELS: Record<OrderDisplayDomainKey, string> = {
   after_sales: '售后',
   order_details: '订单详情', order_history: '订单历史',
 };
+const DOMAIN_DESCRIPTIONS: Record<OrderDisplayDomainKey, string> = {
+  orders: '读取订单列表并上传订单主数据',
+  logistics: '读取每个订单的物流详情',
+  statements: '读取结算单及结算明细',
+  after_sales: '读取退款、退货和取消等售后数据',
+  order_details: '读取订单商品、金额和买家详情',
+  order_history: '读取订单状态变更历史',
+};
+const DISPLAY_DOMAINS: readonly OrderDisplayDomainKey[] = [
+  'orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history',
+];
 
 function Popup() {
   const [state, setState] = useState<OrderSyncState | null>(null);
@@ -86,7 +97,7 @@ function Popup() {
   }, [draft]);
   const sync = (retryFailedOnly: boolean) => run(
     () => send<OrderSyncState>({ type: 'order-sync:sync-domains', retryFailedOnly }),
-    retryFailedOnly ? '失败项已加入同步队列。' : '订单、物流和结算同步已启动。',
+    retryFailedOnly ? '失败项已加入同步队列。' : '订单域各接口同步已启动。',
   );
   const exportLogs = () => {
     if (!state) return;
@@ -114,7 +125,7 @@ function Popup() {
     && state.settings.orderDomainSyncEnabled && !state.settings.syncPaused);
   const automaticBinding = state?.sellerBinding.mode === 'auto';
   const automaticBindingTimedOut = state?.sellerBinding.outcome === 'timeout';
-  const hasFailures = (['orders', 'logistics', 'statements', 'after_sales'] as const).some((domain) => {
+  const hasFailures = DISPLAY_DOMAINS.some((domain) => {
     const row = state?.orderProgress.domains[domain];
     return Boolean(row && (row.lastError || row.pending > 0 || (row.failed ?? 0) > 0
       || row.syncRunStatus === 'partial_failed' || row.syncRunStatus === 'interrupted'));
@@ -149,7 +160,7 @@ function Popup() {
         <div className="section-title"><h2>Seller Center</h2><span className={state?.boundTab?.sellerId ? 'pill live' : 'pill'}>
           {state?.boundTab?.sellerId ? '已连接' : '未连接'}
         </span></div>
-        <p className="description">订单插件会自动复用并固定可用的 Seller Center 页面，使用当前登录会话读取订单、物流和结算数据。</p>
+        <p className="description">订单插件会自动复用并固定可用的 Seller Center 页面，按接口分别读取订单、物流、结算、售后、订单详情和订单历史。</p>
         {state?.boundTab ? <dl><dt>Seller ID</dt><dd>{state.boundTab.sellerId ?? '等待页面请求捕获'}</dd></dl> : null}
         {automaticBinding ? <small className="caption binding-hint">正在搜索可用页面；本轮结束后仍会定时扫描。</small> : null}
         {!automaticBinding && automaticBindingTimedOut && !state?.boundTab?.sellerId
@@ -167,11 +178,12 @@ function Popup() {
             onClick={() => void sync(true)}>重试失败项</button> : null}
         </div>
         <div className="domain-list">
-          {(['orders', 'logistics', 'statements', 'after_sales'] as const).map((domain) => {
+          {DISPLAY_DOMAINS.map((domain) => {
             const row = state?.orderProgress.domains[domain];
             return <div className="domain-row" key={domain}>
               <strong>{DOMAIN_LABELS[domain]}</strong>
               <span>{row?.syncRunStatus === 'running' ? '同步中' : row?.lastSuccessAt ? `最近成功 ${formatTime(row.lastSuccessAt)}` : '等待同步'}</span>
+              <em>{DOMAIN_DESCRIPTIONS[domain]}</em>
               <small>{domain === 'orders' ? `订单数 ${orderTotal(row)} · ` : ''}已上传 {row?.uploaded ?? 0} · 待处理 {row?.pending ?? 0} · 失败 {row?.failed ?? 0}</small>
               {row?.lastError ? <small className="error">{row.lastError}</small> : null}
               {row?.syncRunStatus === 'running' && Date.now() - Date.parse(row.lastProgressAt ?? '') > 2 * 60_000
@@ -205,8 +217,7 @@ function formatNextSync(state: OrderSyncState | null): string {
   if (!state) return '加载中…';
   if (state.orderProgress.status === 'running') return '同步进行中';
   if (state.settings.syncPaused || !state.settings.orderDomainSyncEnabled) return '已暂停';
-  const rows = (['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history'] as const)
-    .map((domain) => state.orderProgress.domains[domain]);
+  const rows = DISPLAY_DOMAINS.map((domain) => state.orderProgress.domains[domain]);
   if (rows.some((row) => (row.pending ?? 0) > 0
     || (row.failed ?? 0) > 0
     || row.currentOrderId != null

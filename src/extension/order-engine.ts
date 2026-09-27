@@ -95,7 +95,6 @@ function runtimeLogContext(
     ...(rawResponse === undefined ? {} : { response: sanitizeRuntimeLogValue(rawResponse) }),
   };
 }
-
 const RUNTIME_SECRET_KEY = /(token|auth|authorization|cookie|password|secret|credential|signature|bsid|access[_-]?key|refresh[_-]?token)/i;
 
 function sanitizeRuntimeLogValue(value: unknown): unknown {
@@ -290,12 +289,20 @@ const ORDER_RECONCILE_MAX_LOGISTICS_PAGES = 20;
 /** 普通模式每 500ms 启动一个请求，理论上限 120 请求/分钟。 */
 const TIKTOK_PAGINATION_PAGE_DELAY_MS = 500;
 
-/** All TikTok requests share one bounded 120 requests/minute admission policy. */
+/**
+ * All TikTok page requests share one serial admission lane.  A single Seller
+ * Center tab is the source of truth, so allowing different domains to overlap
+ * only increases verification risk without improving data correctness.
+ */
 const tiktokRequests = createRequestRateLimiter({
   intervalMs: TIKTOK_PAGINATION_PAGE_DELAY_MS,
-  maxInFlight: 8,
-  reservedSlotsForPriority: { maxPriority: 0, slots: 2 },
+  maxInFlight: 1,
 });
+
+const TIKTOK_ENDPOINT_HARD_FAILURE_THRESHOLD = 10;
+type TikTokEndpointFailureState = { consecutive: number; tripped: boolean };
+const tiktokEndpointFailures = new Map<string, TikTokEndpointFailureState>();
+let tiktokEndpointCircuitOpen = false;
 
 
 type InitialOrderSyncTrigger = 'extension_startup' | 'configuration_ready';
@@ -398,11 +405,65 @@ function resetTikTokTimeoutBackoff(): void {
 }
 
 
-/** Each outbound TikTok request uses the single bounded limiter. */
+/** Each outbound TikTok request uses the single serial limiter. */
 export function tiktokRequestPacer(): {
   acquire: (signal?: AbortSignal) => Promise<() => void>;
 } {
   return { acquire: (signal) => tiktokRequests.acquire(0, signal) };
+}
+
+function tikTokEndpointKey(url: string): string {
+  return orderTikTokEndpointPath(url);
+}
+
+function assertTikTokEndpointCircuitClosed(url: string): void {
+  const endpoint = tikTokEndpointKey(url);
+  const endpointState = tiktokEndpointFailures.get(endpoint);
+  if (tiktokEndpointCircuitOpen || endpointState?.tripped) {
+    throw new StopOrderDomainBatch(`TikTok 接口 ${endpoint} 已触发连续 401/404 熔断，已停止继续请求和上传；需要人工排查后恢复。`);
+  }
+}
+
+async function noteTikTokEndpointResponse(url: string, response: BoundTikTokResponse): Promise<void> {
+  const endpoint = tikTokEndpointKey(url);
+  const previous = tiktokEndpointFailures.get(endpoint) ?? { consecutive: 0, tripped: false };
+  if (response.status !== 401 && response.status !== 404) {
+    if (previous.consecutive > 0) tiktokEndpointFailures.delete(endpoint);
+    return;
+  }
+  const consecutive = previous.consecutive + 1;
+  const next = { consecutive, tripped: previous.tripped || consecutive >= TIKTOK_ENDPOINT_HARD_FAILURE_THRESHOLD };
+  tiktokEndpointFailures.set(endpoint, next);
+  if (!next.tripped || previous.tripped) return;
+  tiktokEndpointCircuitOpen = true;
+  await runOrderSyncStateMutation(async () => {
+    const current = await getOrderSyncStateWithinMutation();
+    const now = new Date().toISOString();
+    const log: OrderRuntimeLog = {
+      id: `order-sync-all-endpoint_circuit_open-${crypto.randomUUID()}`,
+      occurredAt: now,
+      level: 'error',
+      message: `TikTok 接口 ${endpoint} 连续 ${consecutive} 次返回 HTTP ${response.status}，已停止请求下游 TTS-ERP。`,
+      context: runtimeLogContext('order_sync', 'endpoint_circuit_open', 'failed', {
+        endpoint,
+        httpStatus: response.status,
+        consecutiveFailures: consecutive,
+        threshold: TIKTOK_ENDPOINT_HARD_FAILURE_THRESHOLD,
+        stage: 'tiktok_request_guard',
+        manualInterventionRequired: true,
+      }),
+    };
+    await saveOrderSyncState({
+      ...current,
+      settings: { ...current.settings, syncPaused: true },
+      runtimeLogs: [...current.runtimeLogs, log].slice(-MAX_RUNTIME_LOGS),
+    });
+  });
+}
+
+export function resetTikTokEndpointCircuit(): void {
+  tiktokEndpointCircuitOpen = false;
+  tiktokEndpointFailures.clear();
 }
 
 
@@ -1923,7 +1984,7 @@ async function processLogisticsBatch(
         }
         const uploadStartedAt = Date.now();
         try {
-          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'logistics',
             endpoint: detailUrl,
             method: 'GET',
@@ -1950,6 +2011,10 @@ async function processLogisticsBatch(
         }
       }
     } catch (error) {
+      if (error instanceof StopOrderDomainBatch) {
+        stopped = true;
+        break;
+      }
       attemptError = error instanceof Error ? error.message : String(error);
     }
 
@@ -2264,7 +2329,7 @@ async function processOrderDetailsBatch(
         }
         const uploadStartedAt = Date.now();
         try {
-          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'order_details',
             endpoint: detailUrl,
             method: 'POST',
@@ -2291,6 +2356,10 @@ async function processOrderDetailsBatch(
         }
       }
     } catch (error) {
+      if (error instanceof StopOrderDomainBatch) {
+        stopped = true;
+        break;
+      }
       attemptError = error instanceof Error ? error.message : String(error);
     }
 
@@ -2608,7 +2677,7 @@ async function processOrderHistoryBatch(
         }
         const uploadStartedAt = Date.now();
         try {
-          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'order_history',
             endpoint: historyUrl,
             method: 'GET',
@@ -2635,6 +2704,10 @@ async function processOrderHistoryBatch(
         }
       }
     } catch (error) {
+      if (error instanceof StopOrderDomainBatch) {
+        stopped = true;
+        break;
+      }
       attemptError = error instanceof Error ? error.message : String(error);
     }
 
@@ -3393,7 +3466,7 @@ function createOrderPagePipeline(
         displayId: entry.orderId,
         index: Math.max(0, page.fetchedRows - page.rows.length) + index + 1,
         process: async () => {
-          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'orders',
             endpoint: orderUrl,
             method: 'POST',
@@ -3679,7 +3752,7 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
       displayId: entry.orderId,
       index: index + 1,
       process: async () => {
-        await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+        await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
           domain: 'orders',
           endpoint: orderUrl,
           method: 'POST',
@@ -4068,7 +4141,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
         displayId,
         index: index + 1,
         process: async () => {
-          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'statements',
             endpoint: statement.endpoint,
             method: 'GET',
@@ -4187,7 +4260,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
           if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('statements', state)) {
             throw new StopOrderDomainBatch('结算明细上传前同步作用域已变化。');
           }
-          await uploadOrderSyncDump(settings, scope, createOrderSyncDump({
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'statements',
             endpoint: detailUrl,
             method: 'GET',
@@ -4562,15 +4635,28 @@ async function executeTikTokRequestWithTimeout(
   method: 'GET' | 'POST',
   timeoutMs = ORDER_PAGE_REQUEST_TIMEOUT_MS,
 ): Promise<BoundTikTokResponse> {
+  assertTikTokEndpointCircuitClosed(url);
   const controller = new AbortController();
   const release = await tiktokRequestPacer().acquire(controller.signal);
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await executeTikTokRequestInBoundPage(tabId, url, body, controller.signal, method, crypto.randomUUID(), timeoutMs);
+    assertTikTokEndpointCircuitClosed(url);
+    const response = await executeTikTokRequestInBoundPage(tabId, url, body, controller.signal, method, crypto.randomUUID(), timeoutMs);
+    await noteTikTokEndpointResponse(url, response);
+    return response;
   } finally {
     clearTimeout(timeout);
     release();
   }
+}
+
+async function uploadOrderSyncDumpGuarded(
+  ...args: Parameters<typeof uploadOrderSyncDump>
+): Promise<Awaited<ReturnType<typeof uploadOrderSyncDump>>> {
+  if (tiktokEndpointCircuitOpen) {
+    throw new StopOrderDomainBatch('TikTok 接口连续返回 401/404，已停止向下游 TTS-ERP 上传；需要人工排查后恢复。');
+  }
+  return uploadOrderSyncDump(...args);
 }
 
 export async function probeSellerIdentityInBoundPage(tabId: number): Promise<{

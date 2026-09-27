@@ -20,6 +20,7 @@ import {
   recordOrderSyncRuntimeLog,
   reportSchedulerError,
   requestManualOrderDomainSync,
+  resetTikTokEndpointCircuit,
   runInitialOrderDomainSync,
   SELLER_TAB_ALARMS,
   SELLER_TAB_WATCH_DELAY_MINUTES,
@@ -150,7 +151,9 @@ export async function handleOrderMessage(
       const settings = normalizeOrderSyncSettings(message.settings);
       if (settings.syncBaseUrl && !isHttpUrl(settings.syncBaseUrl)) throw new Error('同步地址必须是有效的 HTTP(S) URL。');
       let shouldStartAutoBinding = false;
+      let circuitResetRequested = false;
       const next = await mutateOrderSyncState((current) => {
+        circuitResetRequested = current.settings.syncPaused && !settings.syncPaused;
         const destinationChanged = normalizeOrderSyncBaseUrl(current.settings.syncBaseUrl)
           !== normalizeOrderSyncBaseUrl(settings.syncBaseUrl)
           || current.settings.syncToken.trim() !== settings.syncToken.trim();
@@ -172,6 +175,7 @@ export async function handleOrderMessage(
           } : {}),
         };
       });
+      if (circuitResetRequested) resetTikTokEndpointCircuit();
       await ensureBoundAlarms('configuration_ready');
       if (shouldStartAutoBinding) void startAutomaticSellerBinding().catch((error) => reportError(error, 'auto_bind'));
       return next;

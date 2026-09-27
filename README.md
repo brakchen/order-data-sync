@@ -1,6 +1,6 @@
 # TikTok Shop Order Data Sync
 
-Current version: `0.1.20`
+Current version: `0.1.21`
 
 独立 Chrome MV3 插件代码库，负责订单、物流和结算数据同步。
 
