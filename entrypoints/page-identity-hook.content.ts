@@ -11,6 +11,10 @@ import {
   ORDER_PAGE_PROXY_SOURCE,
   PAGE_PROXY_READY_FLAG,
 } from '../src/extension/page-request-protocol';
+import {
+  SELLER_PAGE_COORDINATION_KEY,
+  SELLER_PAGE_REQUEST_LEASE_MS,
+} from '../src/extension/seller-page-coordination';
 
 const READY_FLAG = '__tiktokOrderSyncIdentityHookReadyV1';
 const SELLER_ID_ENDPOINT_PATH = '/api/v3/seller/common/get';
@@ -166,7 +170,19 @@ function installPageProxy(): void {
     if (active.has(request.requestId)) return;
     const controller = new AbortController();
     active.set(request.requestId, controller);
-    void fetchTikTokResponse(request.url, request.body, request.method, controller.signal, request.timeoutMs, false)
+    void fetchTikTokResponse(
+      request.url,
+      request.body,
+      request.method,
+      controller.signal,
+      request.timeoutMs,
+      false,
+      {
+        storageKey: SELLER_PAGE_COORDINATION_KEY,
+        requestId: request.requestId,
+        leaseMs: SELLER_PAGE_REQUEST_LEASE_MS,
+      },
+    )
       .then((response) => window.postMessage({
         source: ORDER_PAGE_PROXY_SOURCE,
         type: ORDER_PAGE_PROXY_RESPONSE,

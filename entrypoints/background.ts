@@ -4,7 +4,15 @@ import type { OrderExtensionMessage } from '../src/extension/messages';
 import { createDefaultOrderProgress, getOrderSyncState, mutateOrderSyncState } from '../src/extension/storage';
 import type { OrderDomainKey, OrderSyncState } from '../src/core/types';
 import {
+  claimSellerPageRefresh,
+  SELLER_PAGE_COORDINATION_KEY,
+  SELLER_PAGE_REFRESH_CLAIM_MS,
+  SELLER_PAGE_REFRESH_QUIET_MS,
+  type SellerPageRefreshDecision,
+} from '../src/extension/seller-page-coordination';
+import {
   ensureBoundDomainAlarms,
+  getOrderSyncLockSnapshot,
   handleOrderSyncAlarm,
   ORDER_SYNC_ALARMS,
   pollOrderDomain,
@@ -19,6 +27,8 @@ import {
 } from '../src/extension/order-engine';
 
 const SELLER_TAB_REFRESH_DELAY_MINUTES = 120;
+const SELLER_TAB_REFRESH_RETRY_MINUTES = 5;
+const SELLER_TAB_REFRESH_MINIMUM_AGE_MS = SELLER_TAB_REFRESH_DELAY_MINUTES * 60_000;
 const AUTO_BIND_TIMEOUT_MS = 10_000;
 const AUTO_BIND_POLL_INTERVAL_MS = 250;
 let autoBindingRunId = 0;
@@ -40,10 +50,12 @@ export default defineBackground(() => {
   });
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.pinned !== undefined) {
-      void ensureBoundSellerTabRefreshAlarm().catch(reportSchedulerError);
+      void handleBoundTabPinChanged(tabId, changeInfo.pinned)
+        .catch((error) => reportError(error, 'bound_tab_pin_changed'));
     }
-    if (changeInfo.url && isTikTokLoginPage(changeInfo.url)) {
-      void handleLoginRedirect(tabId).catch((error) => reportError(error, 'login_redirect'));
+    if (changeInfo.url) {
+      void handleBoundTabNavigation(tabId, changeInfo.url)
+        .catch((error) => reportError(error, 'bound_tab_navigation'));
     }
   });
 
@@ -209,28 +221,14 @@ async function bindCurrentSellerTab(): Promise<OrderSyncState> {
   });
   try {
     await pinSellerTab(tab.id, 'manual_bind');
-    await recordOrderSyncRuntimeLog('all', 'seller_bind_requested', 'started', '已绑定当前 Seller Center 页面，准备刷新并捕获 Seller ID。', {
+    await recordOrderSyncRuntimeLog('all', 'seller_bind_requested', 'started', '已绑定当前 Seller Center 页面，准备主动读取 Seller ID。', {
       stage: 'seller_binding',
       tabId: tab.id,
       pageOrigin: new URL(tab.url!).origin,
       pagePath: new URL(tab.url!).pathname,
-      reloadRequested: true,
+      reloadRequested: false,
     });
-    // Install the document_start identity and page proxy hooks on an already-open tab.
-    try {
-      await chrome.tabs.reload(tab.id, { bypassCache: true });
-    } catch (error) {
-      await recordOrderSyncRuntimeLog('all', 'seller_bind_reload_failed', 'failed', 'Seller Center 页面刷新失败，尚未完成 Seller ID 捕获。', {
-        stage: 'seller_binding',
-        tabId: tab.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-    await recordOrderSyncRuntimeLog('all', 'seller_bind_reloaded', 'succeeded', 'Seller Center 页面已刷新，等待页面请求中的 Seller ID。', {
-      stage: 'seller_binding',
-      tabId: tab.id,
-    });
+    await probeAndCaptureSellerIdentity(tab);
     await ensureBoundAlarms();
   } finally {
     await mutateOrderSyncState((current) => current.sellerBinding.mode === 'manual'
@@ -432,7 +430,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
           };
         });
         if (recovered) await ensureBoundAlarms('configuration_ready');
-        await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_failed', 'failed', '自动绑定 Seller Center 页面失败，已恢复手动绑定。', {
+        await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_failed', 'failed', '本轮自动绑定 Seller Center 页面失败，将按定时扫描继续重试。', {
           stage: 'seller_binding',
           tabId: candidate.id,
           error: error instanceof Error ? error.message : String(error),
@@ -440,46 +438,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
         return;
       }
       candidateFound = true;
-      try {
-        await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_started', 'started', '已主动请求 Seller Center 店铺信息接口。', {
-          stage: 'seller_binding',
-          tabId: candidate.id,
-          pageOrigin: new URL(candidate.url).origin,
-          requestType: 'GET',
-          endpointPath: '/api/v3/seller/common/get',
-          timeoutMs: 2_500,
-        });
-        const probe = await probeSellerIdentityInBoundPage(candidate.id);
-        const captured = await captureSellerIdentity({
-          sellerId: probe.identity.sellerId,
-          url: candidate.url,
-          ...(probe.identity.shopName ? { shopName: probe.identity.shopName } : {}),
-          ...(probe.identity.shopCode ? { shopCode: probe.identity.shopCode } : {}),
-          ...(probe.identity.shopRegion ? { shopRegion: probe.identity.shopRegion } : {}),
-          ...(probe.identity.regionCode ? { regionCode: probe.identity.regionCode } : {}),
-        }, { tab: { id: candidate.id } as chrome.tabs.Tab });
-        await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_succeeded', 'succeeded', '已主动获取并写入 Seller Center 店铺信息。', {
-          stage: 'seller_binding',
-          tabId: candidate.id,
-          sellerId: probe.identity.sellerId,
-          shopName: probe.identity.shopName ?? null,
-          shopCode: probe.identity.shopCode ?? null,
-          shopRegion: probe.identity.shopRegion ?? null,
-          regionCode: probe.identity.regionCode ?? null,
-          requestMode: probe.response.requestMode ?? null,
-          httpStatus: probe.response.status,
-          stateBound: Boolean(captured.boundTab?.sellerId),
-        });
-      } catch (error) {
-        const probeResponse = isRecord(error) && 'response' in error ? error.response : null;
-        await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_failed', 'failed', '主动获取 Seller Center 店铺信息失败，将继续等待页面被动请求捕获。', {
-          stage: 'seller_binding',
-          tabId: candidate.id,
-          error: error instanceof Error ? error.message : String(error),
-          httpStatus: isRecord(probeResponse) && typeof probeResponse.status === 'number' ? probeResponse.status : null,
-          requestMode: isRecord(probeResponse) && typeof probeResponse.requestMode === 'string' ? probeResponse.requestMode : null,
-        });
-      }
+      await probeAndCaptureSellerIdentity(candidate);
       continue;
     }
     await new Promise((resolve) => setTimeout(resolve, AUTO_BIND_POLL_INTERVAL_MS));
@@ -504,7 +463,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
     };
   });
   if (timedOut) await ensureBoundAlarms('configuration_ready');
-  await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_timeout', 'skipped', '自动绑定 Seller Center 页面超过 10 秒未完成，已恢复手动绑定。', {
+  await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_timeout', 'skipped', '本轮 10 秒自动扫描未完成，将在下一次定时扫描继续重试。', {
     stage: 'seller_binding',
     timeoutMs: AUTO_BIND_TIMEOUT_MS,
     candidateFound,
@@ -515,12 +474,22 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
 
 async function findAutomaticSellerTab(): Promise<chrome.tabs.Tab | null> {
   const tabs = await chrome.tabs.query({});
-  return tabs
+  const sellerTabs = tabs
     .filter((tab) => tab.id !== undefined && tab.url && isSellerCenterUrl(tab.url)
-      && !isTikTokLoginPage(tab.url))
-    .sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned))
-      || Number(Boolean(right.active)) - Number(Boolean(left.active))
-      || (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0] ?? null;
+      && !isTikTokLoginPage(tab.url));
+  const pinnedSellerTabs = sellerTabs.filter((tab) => tab.pinned === true);
+  const candidatePool = pinnedSellerTabs.length > 0 ? pinnedSellerTabs : sellerTabs;
+  const candidate = candidatePool
+    .filter((tab) => tab.discarded !== true && tab.status !== 'loading')
+    .sort(compareSellerCenterTabs)[0] ?? null;
+  if (!candidate && pinnedSellerTabs.length > 0) {
+    const discardedPinnedTab = pinnedSellerTabs.find((tab) => tab.discarded === true);
+    if (discardedPinnedTab?.id !== undefined) {
+      const decision = await claimSharedSellerPageRefresh(discardedPinnedTab.id, 0).catch(() => null);
+      if (decision?.allowed) await chrome.tabs.reload(discardedPinnedTab.id).catch(() => undefined);
+    }
+  }
+  return candidate;
 }
 
 async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<void> {
@@ -552,10 +521,57 @@ async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<voi
   await ensureBoundAlarms('configuration_ready');
 }
 
+async function probeAndCaptureSellerIdentity(candidate: chrome.tabs.Tab): Promise<boolean> {
+  if (candidate.id === undefined || !candidate.url) return false;
+  try {
+    await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_started', 'started', '已主动请求 Seller Center 店铺信息接口。', {
+      stage: 'seller_binding',
+      tabId: candidate.id,
+      pageOrigin: new URL(candidate.url).origin,
+      requestType: 'GET',
+      endpointPath: '/api/v3/seller/common/get',
+      timeoutMs: 2_500,
+    });
+    const probe = await probeSellerIdentityInBoundPage(candidate.id);
+    const captured = await captureSellerIdentity({
+      sellerId: probe.identity.sellerId,
+      url: candidate.url,
+      ...(probe.identity.shopName ? { shopName: probe.identity.shopName } : {}),
+      ...(probe.identity.shopCode ? { shopCode: probe.identity.shopCode } : {}),
+      ...(probe.identity.shopRegion ? { shopRegion: probe.identity.shopRegion } : {}),
+      ...(probe.identity.regionCode ? { regionCode: probe.identity.regionCode } : {}),
+    }, { tab: { id: candidate.id } as chrome.tabs.Tab });
+    const stateBound = Boolean(captured.boundTab?.sellerId);
+    await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_succeeded', 'succeeded', '已主动获取并写入 Seller Center 店铺信息。', {
+      stage: 'seller_binding',
+      tabId: candidate.id,
+      sellerId: probe.identity.sellerId,
+      shopName: probe.identity.shopName ?? null,
+      shopCode: probe.identity.shopCode ?? null,
+      shopRegion: probe.identity.shopRegion ?? null,
+      regionCode: probe.identity.regionCode ?? null,
+      requestMode: probe.response.requestMode ?? null,
+      httpStatus: probe.response.status,
+      stateBound,
+    });
+    return stateBound;
+  } catch (error) {
+    const probeResponse = isRecord(error) && 'response' in error ? error.response : null;
+    await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_failed', 'failed', '主动获取 Seller Center 店铺信息失败，将由定时扫描继续重试。', {
+      stage: 'seller_binding',
+      tabId: candidate.id,
+      error: error instanceof Error ? error.message : String(error),
+      httpStatus: isRecord(probeResponse) && typeof probeResponse.status === 'number' ? probeResponse.status : null,
+      requestMode: isRecord(probeResponse) && typeof probeResponse.requestMode === 'string' ? probeResponse.requestMode : null,
+    });
+    return false;
+  }
+}
+
 async function handleBoundTabRemoved(tabId: number): Promise<void> {
   const current = await getOrderSyncState();
   if (current.boundTab?.tabId !== tabId) return;
-  const replacement = await findReplacementSellerTab(current.boundTab, tabId);
+  const replacement = await findReplacementSellerTab(tabId);
   if (replacement?.id !== undefined && replacement.url) {
     await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_removed');
     return;
@@ -565,7 +581,7 @@ async function handleBoundTabRemoved(tabId: number): Promise<void> {
     const { sellerId: _sellerId, ...withoutSellerId } = state.boundTab;
     return { ...state, boundTab: withoutSellerId };
   });
-  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_unavailable', 'skipped', '绑定 Seller Center 页面已关闭，暂未找到同域名候选页面。', {
+  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_unavailable', 'skipped', '绑定 Seller Center 页面已关闭，暂未找到可用候选页面。', {
     stage: 'seller_binding',
     reason: 'bound_tab_removed_without_replacement',
     closedTabId: tabId,
@@ -579,7 +595,7 @@ async function handleBoundTabRemoved(tabId: number): Promise<void> {
 async function handleLoginRedirect(tabId: number): Promise<void> {
   const current = await getOrderSyncState();
   if (current.boundTab?.tabId !== tabId) return;
-  const replacement = await findReplacementSellerTab(current.boundTab, tabId);
+  const replacement = await findReplacementSellerTab(tabId);
   if (replacement?.id !== undefined && replacement.url) {
     await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_login_redirect');
     return;
@@ -597,31 +613,86 @@ async function handleLoginRedirect(tabId: number): Promise<void> {
   await ensureBoundAlarms('configuration_ready');
 }
 
-async function findReplacementSellerTab(
-  previousBoundTab: NonNullable<OrderSyncState['boundTab']>,
-  excludedTabId?: number,
-): Promise<chrome.tabs.Tab | null> {
-  const previousOrigin = new URL(previousBoundTab.url).origin;
+async function handleBoundTabPinChanged(tabId: number, pinned: boolean): Promise<void> {
+  const current = await getOrderSyncState();
+  if (current.boundTab?.tabId !== tabId) return;
+  if (!pinned) await pinSellerTab(tabId, 'binding_repair');
+  await ensureBoundSellerTabRefreshAlarm();
+}
+
+async function handleBoundTabNavigation(tabId: number, url: string): Promise<void> {
+  const current = await getOrderSyncState();
+  if (current.boundTab?.tabId !== tabId) return;
+  if (isTikTokLoginPage(url)) {
+    await handleLoginRedirect(tabId);
+    return;
+  }
+  if (isSellerCenterUrl(url)) {
+    if (current.boundTab.url !== url) {
+      await mutateOrderSyncState((state) => state.boundTab?.tabId === tabId
+        ? { ...state, boundTab: { ...state.boundTab, url } }
+        : state);
+    }
+    await ensureBoundSellerTabRefreshAlarm();
+    return;
+  }
+
+  const replacement = await findReplacementSellerTab(tabId);
+  if (replacement?.id !== undefined && replacement.url) {
+    await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_navigation');
+    return;
+  }
+  await mutateOrderSyncState((state) => {
+    if (state.boundTab?.tabId !== tabId) return state;
+    const { sellerId: _sellerId, ...withoutSellerId } = state.boundTab;
+    return { ...state, boundTab: { ...withoutSellerId, url } };
+  });
+  await recordOrderSyncRuntimeLog('all', 'seller_tab_navigation_invalid', 'skipped', '绑定页面已离开 Seller Center，暂停同步并等待可用页面。', {
+    stage: 'seller_binding',
+    tabId,
+    pageUrl: url,
+    replacementScanScheduled: true,
+  });
+  await ensureBoundAlarms('configuration_ready');
+}
+
+async function findReplacementSellerTab(excludedTabId?: number): Promise<chrome.tabs.Tab | null> {
   const tabs = await chrome.tabs.query({});
-  return tabs
+  const sellerTabs = tabs
     .filter((tab) => tab.id !== undefined && tab.id !== excludedTabId && isSellerCenterUrl(tab.url)
-      && !isTikTokLoginPage(tab.url ?? '')
-      && new URL(tab.url!).origin === previousOrigin)
-    .sort((left, right) => Number(Boolean(right.pinned)) - Number(Boolean(left.pinned))
-      || Number(Boolean(right.active)) - Number(Boolean(left.active))
-      || (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0))[0] ?? null;
+      && !isTikTokLoginPage(tab.url ?? ''));
+  const pinnedSellerTabs = sellerTabs.filter((tab) => tab.pinned === true);
+  const candidatePool = pinnedSellerTabs.length > 0 ? pinnedSellerTabs : sellerTabs;
+  const candidate = candidatePool
+    .filter((tab) => tab.discarded !== true && tab.status !== 'loading')
+    .sort(compareSellerCenterTabs)[0] ?? null;
+  if (!candidate && pinnedSellerTabs.length > 0) {
+    const discardedPinnedTab = pinnedSellerTabs.find((tab) => tab.discarded === true);
+    if (discardedPinnedTab?.id !== undefined) {
+      const decision = await claimSharedSellerPageRefresh(discardedPinnedTab.id, 0).catch(() => null);
+      if (decision?.allowed) await chrome.tabs.reload(discardedPinnedTab.id).catch(() => undefined);
+    }
+  }
+  return candidate;
 }
 
 async function scanForReplacementSellerTab(): Promise<void> {
   const current = await getOrderSyncState();
-  if (!current.boundTab || current.boundTab.sellerId) {
+  if (!current.settings.syncBaseUrl.trim() || !current.settings.syncToken.trim() || current.boundTab?.sellerId) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
+    return;
+  }
+
+  if (!current.boundTab) {
+    await startAutomaticSellerBinding();
+    await ensureSellerBindingWatchAlarm();
     return;
   }
 
   try {
     const currentTab = await chrome.tabs.get(current.boundTab.tabId);
     if (isSellerCenterUrl(currentTab.url) && !isTikTokLoginPage(currentTab.url ?? '')) {
+      await probeAndCaptureSellerIdentity(currentTab);
       await ensureSellerBindingWatchAlarm();
       return;
     }
@@ -629,7 +700,7 @@ async function scanForReplacementSellerTab(): Promise<void> {
     // The previously bound tab is gone; continue looking for a replacement.
   }
 
-  const replacement = await findReplacementSellerTab(current.boundTab, current.boundTab.tabId);
+  const replacement = await findReplacementSellerTab(current.boundTab.tabId);
   if (replacement?.id !== undefined && replacement.url) {
     await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_removed');
     return;
@@ -641,7 +712,7 @@ async function scanForReplacementSellerTab(): Promise<void> {
 async function autoRebindSellerTab(
   previousBoundTab: NonNullable<OrderSyncState['boundTab']>,
   replacement: chrome.tabs.Tab,
-  reason: 'bound_tab_removed' | 'bound_tab_login_redirect',
+  reason: 'bound_tab_removed' | 'bound_tab_login_redirect' | 'bound_tab_navigation',
 ): Promise<void> {
   const tabId = replacement.id!;
   const tabUrl = replacement.url!;
@@ -656,7 +727,7 @@ async function autoRebindSellerTab(
     },
   }));
   if (replacement.pinned !== true) await pinSellerTab(tabId, 'auto_rebind');
-  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_requested', 'started', '已自动切换到同域名 Seller Center 页面。', {
+  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_requested', 'started', '已自动切换到可用的 Seller Center 页面。', {
     stage: 'seller_binding',
     reason,
     previousTabId: previousBoundTab.tabId,
@@ -664,7 +735,7 @@ async function autoRebindSellerTab(
     pageOrigin: new URL(tabUrl).origin,
     preservedProgress: true,
   });
-  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_ready', 'succeeded', '已自动接管同域名 Seller Center 页面，不刷新当前页面，继续使用现有会话。', {
+  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_ready', 'succeeded', '已自动接管可用的 Seller Center 页面，不刷新当前页面，继续使用现有会话。', {
     stage: 'seller_binding',
     reason,
     replacementTabId: tabId,
@@ -674,7 +745,10 @@ async function autoRebindSellerTab(
   await ensureBoundAlarms('configuration_ready');
 }
 
-async function pinSellerTab(tabId: number, reason: 'manual_bind' | 'auto_bind' | 'auto_rebind'): Promise<void> {
+async function pinSellerTab(
+  tabId: number,
+  reason: 'manual_bind' | 'auto_bind' | 'auto_rebind' | 'binding_repair',
+): Promise<void> {
   try {
     await chrome.tabs.update(tabId, { pinned: true });
     await recordOrderSyncRuntimeLog('all', 'seller_tab_pinned', 'succeeded', '已固定绑定的 Seller Center 页面。', {
@@ -730,7 +804,7 @@ async function ensureBoundSellerTabRefreshAlarm(): Promise<void> {
 
 async function ensureSellerBindingWatchAlarm(): Promise<void> {
   const state = await getOrderSyncState();
-  if (!state.boundTab || state.boundTab.sellerId) {
+  if (!state.settings.syncBaseUrl.trim() || !state.settings.syncToken.trim() || state.boundTab?.sellerId) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
     return;
   }
@@ -774,6 +848,41 @@ async function refreshBoundSellerTab(): Promise<void> {
     return;
   }
 
+  const syncLocks = getOrderSyncLockSnapshot();
+  if (syncLocks.manualStartPending || syncLocks.ordersInFlight || syncLocks.domainsInFlight.length > 0) {
+    await recordOrderSyncRuntimeLog('all', 'seller_tab_refresh_skipped', 'skipped', '固定 Seller Center 页面正在执行订单域请求，延后刷新。', {
+      stage: 'seller_binding',
+      tabId: boundTab.tabId,
+      reason: 'active_order_sync',
+      syncLocks,
+      retryInMinutes: SELLER_TAB_REFRESH_RETRY_MINUTES,
+    });
+    await scheduleBoundSellerTabRefresh(SELLER_TAB_REFRESH_RETRY_MINUTES);
+    return;
+  }
+
+  const refreshDecision = await claimSharedSellerPageRefresh(
+    boundTab.tabId,
+    SELLER_TAB_REFRESH_MINIMUM_AGE_MS,
+  );
+  if (!refreshDecision.allowed) {
+    const retryInMinutes = Math.min(
+      SELLER_TAB_REFRESH_DELAY_MINUTES,
+      Math.max(1, Math.ceil(refreshDecision.retryAfterMs / 60_000)),
+    );
+    await recordOrderSyncRuntimeLog('all', 'seller_tab_refresh_skipped', 'skipped', '共享 Seller Center 页面正在使用或最近已刷新，延后本插件刷新。', {
+      stage: 'seller_binding',
+      tabId: boundTab.tabId,
+      reason: refreshDecision.reason,
+      pageAgeMs: refreshDecision.pageAgeMs,
+      activeRequestCount: refreshDecision.activeRequestCount,
+      retryAfterMs: refreshDecision.retryAfterMs,
+      retryInMinutes,
+    });
+    await scheduleBoundSellerTabRefresh(retryInMinutes);
+    return;
+  }
+
   try {
     await chrome.tabs.reload(boundTab.tabId, { bypassCache: true });
     await recordOrderSyncRuntimeLog('all', 'seller_tab_refreshed', 'succeeded', '已按 2 小时周期刷新固定的 Seller Center 页面，保持会话有效。', {
@@ -787,9 +896,65 @@ async function refreshBoundSellerTab(): Promise<void> {
       tabId: boundTab.tabId,
       error: error instanceof Error ? error.message : String(error),
     });
+    await scheduleBoundSellerTabRefresh(SELLER_TAB_REFRESH_RETRY_MINUTES);
+    return;
   }
 
-  await ensureBoundSellerTabRefreshAlarm();
+  await scheduleBoundSellerTabRefresh(SELLER_TAB_REFRESH_DELAY_MINUTES);
+}
+
+async function scheduleBoundSellerTabRefresh(delayInMinutes: number): Promise<void> {
+  const state = await getOrderSyncState();
+  if (!state.boundTab) {
+    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
+    return;
+  }
+  await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
+  await chrome.alarms.create(SELLER_TAB_ALARMS.refresh, {
+    delayInMinutes: Math.max(1, delayInMinutes),
+  });
+}
+
+async function claimSharedSellerPageRefresh(
+  tabId: number,
+  minimumPageAgeMs: number,
+): Promise<SellerPageRefreshDecision> {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: claimSellerPageRefresh,
+    args: [
+      SELLER_PAGE_COORDINATION_KEY,
+      minimumPageAgeMs,
+      SELLER_PAGE_REFRESH_CLAIM_MS,
+      SELLER_PAGE_REFRESH_QUIET_MS,
+    ],
+  });
+  return results[0]?.result ?? {
+    allowed: false,
+    reason: 'coordination_unavailable',
+    pageAgeMs: 0,
+    retryAfterMs: 60_000,
+    activeRequestCount: 0,
+  };
+}
+
+function compareSellerCenterTabs(left: chrome.tabs.Tab, right: chrome.tabs.Tab): number {
+  return Number(right.pinned === true) - Number(left.pinned === true)
+    || Number(isSellerCenterAdsPage(right.url)) - Number(isSellerCenterAdsPage(left.url))
+    || Number(Boolean(right.active)) - Number(Boolean(left.active))
+    || (right.lastAccessed ?? 0) - (left.lastAccessed ?? 0)
+    || (left.id ?? Number.MAX_SAFE_INTEGER) - (right.id ?? Number.MAX_SAFE_INTEGER);
+}
+
+function isSellerCenterAdsPage(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return isSellerCenterUrl(value) && url.pathname.startsWith('/ads-creation');
+  } catch {
+    return false;
+  }
 }
 
 async function clearOrderAlarms(): Promise<void> {

@@ -20,6 +20,12 @@ export interface BoundTikTokResponse {
   };
 }
 
+export interface SellerPageRequestCoordination {
+  storageKey: string;
+  requestId: string;
+  leaseMs: number;
+}
+
 /** Self-contained: Chrome serializes this function into the authenticated MAIN world. */
 export async function fetchTikTokResponse(
   requestUrl: string,
@@ -28,8 +34,37 @@ export async function fetchTikTokResponse(
   signalOrTimeoutMs?: AbortSignal | number,
   timeoutMs?: number,
   parseResponse = true,
+  coordination?: SellerPageRequestCoordination,
 ): Promise<BoundTikTokResponse> {
   const pageStartedAt = Date.now();
+  let coordinationStarted = false;
+  if (coordination && typeof globalThis.localStorage !== 'undefined') {
+    try {
+      const parsed = JSON.parse(globalThis.localStorage.getItem(coordination.storageKey) ?? '{}') as {
+        activeRequests?: Record<string, number>;
+        lastActivityAt?: number;
+        refreshClaimUntil?: number;
+      };
+      if (typeof parsed.refreshClaimUntil === 'number' && parsed.refreshClaimUntil > pageStartedAt) {
+        throw Object.assign(new Error('Seller Center 页面即将刷新，请求将在刷新后重试。'), {
+          name: 'SellerPageRefreshClaimedError',
+        });
+      }
+      const activeRequests = typeof parsed.activeRequests === 'object' && parsed.activeRequests !== null
+        ? Object.fromEntries(Object.entries(parsed.activeRequests)
+          .filter(([, expiresAt]) => typeof expiresAt === 'number' && expiresAt > pageStartedAt)) : {};
+      activeRequests[coordination.requestId] = pageStartedAt + coordination.leaseMs;
+      globalThis.localStorage.setItem(coordination.storageKey, JSON.stringify({
+        activeRequests,
+        lastActivityAt: typeof parsed.lastActivityAt === 'number' ? parsed.lastActivityAt : 0,
+        refreshClaimUntil: typeof parsed.refreshClaimUntil === 'number' ? parsed.refreshClaimUntil : 0,
+      }));
+      coordinationStarted = true;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SellerPageRefreshClaimedError') throw error;
+      // The request still runs; refresh claiming fails closed when shared storage is unavailable.
+    }
+  }
   const signal = typeof signalOrTimeoutMs === 'number' ? undefined : signalOrTimeoutMs;
   const pageTimeoutMs = typeof signalOrTimeoutMs === 'number' ? signalOrTimeoutMs : timeoutMs;
   const pageController = pageTimeoutMs !== undefined && Number.isFinite(pageTimeoutMs) && pageTimeoutMs > 0
@@ -140,5 +175,25 @@ export async function fetchTikTokResponse(
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
     if (callerAbortHandler && signal !== undefined) signal.removeEventListener('abort', callerAbortHandler);
+    if (coordinationStarted && coordination && typeof globalThis.localStorage !== 'undefined') {
+      try {
+        const now = Date.now();
+        const parsed = JSON.parse(globalThis.localStorage.getItem(coordination.storageKey) ?? '{}') as {
+          activeRequests?: Record<string, number>;
+          refreshClaimUntil?: number;
+        };
+        const activeRequests = typeof parsed.activeRequests === 'object' && parsed.activeRequests !== null
+          ? Object.fromEntries(Object.entries(parsed.activeRequests)
+            .filter(([id, expiresAt]) => id !== coordination.requestId
+              && typeof expiresAt === 'number' && expiresAt > now)) : {};
+        globalThis.localStorage.setItem(coordination.storageKey, JSON.stringify({
+          activeRequests,
+          lastActivityAt: now,
+          refreshClaimUntil: typeof parsed.refreshClaimUntil === 'number' ? parsed.refreshClaimUntil : 0,
+        }));
+      } catch {
+        // Expired request leases are pruned by the next request or refresh claimant.
+      }
+    }
   }
 }

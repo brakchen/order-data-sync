@@ -11,6 +11,10 @@ import {
 } from '../core/order-sync';
 import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryQuery, createOrderListRequestBody, tiktokOrderEndpointUrl } from '../core/tiktok-order-endpoints';
 import { parseSellerIdentityResponse, tiktokSellerIdentityEndpointUrl, type SellerIdentityResponseData } from '../core/tiktok-seller-endpoints';
+import {
+  SELLER_PAGE_COORDINATION_KEY,
+  SELLER_PAGE_REQUEST_LEASE_MS,
+} from './seller-page-coordination';
 import { OrderGetResponseSchema, OrderHistoryResponseSchema } from '../core/tiktok-order-endpoint-schemas';
 import { isCancelledTikTokOrderRow } from '../core/tiktok-order-status';
 import {
@@ -2919,6 +2923,20 @@ const stoppedOrderRunIds = new Set<string>();
 
 let manualOrderDomainSyncRequested = false;
 
+export interface OrderSyncLockSnapshot {
+  manualStartPending: boolean;
+  ordersInFlight: boolean;
+  domainsInFlight: OrderDomainKey[];
+}
+
+export function getOrderSyncLockSnapshot(): OrderSyncLockSnapshot {
+  return {
+    manualStartPending: manualOrderDomainSyncRequested,
+    ordersInFlight: orderSyncInFlight,
+    domainsInFlight: [...orderDomainInFlight],
+  };
+}
+
 let initialOrderDomainSyncStartedFor: string | null = null;
 let initialOrderDomainSyncPromise: Promise<void> | null = null;
 
@@ -4482,7 +4500,11 @@ async function executeTikTokRequestInBoundPage(
         func: fetchTikTokResponse,
         // AbortSignal is not structured-cloneable. Pass a duration so the
         // serialized MAIN-world function can cancel its own fetch instead.
-        args: [url, body, method, timeoutMs],
+        args: [url, body, method, timeoutMs, undefined, true, {
+          storageKey: SELLER_PAGE_COORDINATION_KEY,
+          requestId,
+          leaseMs: SELLER_PAGE_REQUEST_LEASE_MS,
+        }],
       });
       const aborted = new Promise<never>((_, reject) => {
         abortHandler = () => reject(new DOMException('Request aborted', 'AbortError'));
