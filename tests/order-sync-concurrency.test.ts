@@ -95,12 +95,25 @@ beforeEach(() => {
         data: { main_orders: [], has_more: false, total_count: 0 },
       })),
     },
+    tabs: {
+      sendMessage: vi.fn(),
+    },
   } as unknown as typeof chrome;
 });
 
 afterEach(() => vi.useRealTimers());
 
 describe('order domain concurrent scope changes', () => {
+  it('falls back to MAIN-world execution when the page message port closes', async () => {
+    vi.mocked(chrome.tabs.sendMessage).mockRejectedValueOnce(
+      new Error('The message port closed before a response was received.'),
+    );
+
+    await handleOrderSyncAlarm();
+
+    expect(chrome.scripting.executeScript).toHaveBeenCalled();
+  });
+
   it('does not upload an old seller page into the newly bound seller', async () => {
     vi.mocked(chrome.scripting.executeScript).mockImplementation(async () => {
       harness.state = stateFor('seller-B');
