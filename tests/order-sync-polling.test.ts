@@ -1357,7 +1357,7 @@ describe('物流域（N+1，逐单详情）', () => {
 
     await pollOrderDomain('logistics');
 
-    expect(requestedMethods).toEqual(['POST', 'GET']);
+    expect(requestedMethods).toEqual(['POST', 'POST']);
     expect(requested[1]).toContain('main_order_id=active');
     expect(requested[1]).not.toContain('main_order_id=cancelled');
     expect(uploadsForDomain('logistics').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))

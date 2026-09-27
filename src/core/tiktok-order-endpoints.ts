@@ -82,7 +82,30 @@ export function createOrderGetRequestBody(mainOrderIds: string[]): Record<string
   return { main_order_id: mainOrderIds };
 }
 
-/** Query params for order/history (GET — no body). */
+/** Legacy query helper retained for callers that still inspect the old contract. */
 export function createOrderHistoryQuery(mainOrderId: string): Record<string, string> {
   return { main_order_id: mainOrderId };
+}
+
+/**
+ * Current Seller Center order-history contract (captured 2026-09-27): POST
+ * with the order ID in JSON, not GET with main_order_id in the query string.
+ */
+export function tiktokOrderHistoryEndpointUrl(origin: string, sellerId: string): string {
+  const base = `${origin}${TIKTOK_ORDER_ENDPOINT_PATHS['order-history']}`;
+  const params = new URLSearchParams({
+    aid: '4068',
+    locale: 'zh-CN',
+    oec_seller_id: sellerId,
+    seller_id: sellerId,
+  });
+  return `${base}?${params.toString()}`;
+}
+
+export function createOrderHistoryRequestBody(
+  mainOrderId: string,
+  offset = 0,
+  pageSize = 10,
+): Record<string, unknown> {
+  return { main_order_id: mainOrderId, offset, page_size: pageSize };
 }

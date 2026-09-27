@@ -4,7 +4,9 @@ import {
   createLogisticDetailQuery,
   createOrderGetRequestBody,
   createOrderHistoryQuery,
+  createOrderHistoryRequestBody,
   tiktokOrderEndpointUrl,
+  tiktokOrderHistoryEndpointUrl,
   TIKTOK_ORDER_ENDPOINT_PATHS,
 } from '../src/core/tiktok-order-endpoints';
 import {
@@ -90,6 +92,20 @@ describe('createOrderHistoryQuery', () => {
   it('builds main_order_id query param', () => {
     expect(createOrderHistoryQuery('586055106746877269')).toEqual({
       main_order_id: '586055106746877269',
+    });
+  });
+});
+
+describe('current order/history contract', () => {
+  it('builds the captured POST URL and body', () => {
+    expect(tiktokOrderHistoryEndpointUrl(
+      'https://seller.tiktokshopglobalselling.com',
+      '7494864868604150914',
+    )).toBe('https://seller.tiktokshopglobalselling.com/api/v1/fulfillment/order/history?aid=4068&locale=zh-CN&oec_seller_id=7494864868604150914&seller_id=7494864868604150914');
+    expect(createOrderHistoryRequestBody('586275495688963095')).toEqual({
+      main_order_id: '586275495688963095',
+      offset: 0,
+      page_size: 10,
     });
   });
 });

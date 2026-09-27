@@ -332,9 +332,10 @@
 
 ## 2. `api/v1/fulfillment/order/history`（订单历史）
 
-- **Method**: `GET`
+- **Method**: `POST`
 - **URL**: `https://seller.tiktokshopglobalselling.com/api/v1/fulfillment/order/history`
-- **Query params**: 当前 builder 会附带 `locale=zh-CN&language=zh-CN&aid=6556&app_name=i18n_ecom_shop&device_platform=web&cookie_enabled=true&oec_seller_id={seller_id}&seller_id={seller_id}&main_order_id={order_id}`
+- **Query params**: 当前页面请求使用 `aid=4068&locale=zh-CN&oec_seller_id={seller_id}&seller_id={seller_id}`
+- **JSON body**: `{ "main_order_id": "{order_id}", "offset": 0, "page_size": 10 }`
 
 ### 2.1 Response 结构
 
@@ -445,7 +446,7 @@
 | order/list | `/api/fulfillment/order/list` | POST | 订单列表（分页） | ✅ 已接入 |
 | logistic_detail/list | `/api/v1/fulfillment/logistic_detail/list` | GET | 物流详情 | ✅ 已接入 |
 | **order/get** | `/api/fulfillment/order/get` | POST | **订单详情（含价格/退货/买家）** | ✅ 本次新增 |
-| **order/history** | `/api/v1/fulfillment/order/history` | GET | **订单状态时间线** | ✅ 本次新增 |
+| **order/history** | `/api/v1/fulfillment/order/history` | POST | **订单状态时间线** | ✅ 本次新增 |
 
 ## 4. 当前同步链路注意事项
 

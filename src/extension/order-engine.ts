@@ -9,7 +9,7 @@ import {
   type OrderSyncScope,
   type OrderSyncSettings as OrderApiSettings,
 } from '../core/order-sync';
-import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryQuery, createOrderListRequestBody, tiktokOrderEndpointUrl } from '../core/tiktok-order-endpoints';
+import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryRequestBody, createOrderListRequestBody, tiktokOrderEndpointUrl, tiktokOrderHistoryEndpointUrl } from '../core/tiktok-order-endpoints';
 import { parseSellerIdentityResponse, tiktokSellerIdentityEndpointUrl, type SellerIdentityResponseData } from '../core/tiktok-seller-endpoints';
 import {
   SELLER_PAGE_COORDINATION_KEY,
@@ -2566,24 +2566,20 @@ async function processOrderHistoryBatch(
         stopped = true;
         break;
       }
-      const historyUrl = tiktokOrderEndpointUrl(
-        origin,
-        'order-history',
-        { sellerId: boundTab.sellerId! },
-        createOrderHistoryQuery(orderId),
-      );
+      const historyUrl = tiktokOrderHistoryEndpointUrl(origin, boundTab.sellerId!);
+      const historyBody = createOrderHistoryRequestBody(orderId);
       const requestStartedAt = Date.now();
       let detail: BoundTikTokResponse;
       try {
-        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, historyUrl, {}, 'GET');
+        detail = await executeTikTokRequestWithTimeout(boundTab.tabId, historyUrl, historyBody, 'POST');
       } catch (error) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史请求异常。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody),
           ...orderRequestExceptionDetails(error),
         });
         throw error;
@@ -2598,11 +2594,11 @@ async function processOrderHistoryBatch(
       if (!detail.ok) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应失败。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
         if (isTikTokAuthenticationFailure(detail)) {
@@ -2613,12 +2609,12 @@ async function processOrderHistoryBatch(
       } else if (isTikTokAuthenticationFailure(detail)) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应要求重新登录。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           failureReason: 'authentication_required',
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
         await clearOrderBinding(state, 'order_history_authentication_failed');
@@ -2627,48 +2623,48 @@ async function processOrderHistoryBatch(
       } else if (detailPayload === null) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应为空。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           failureReason: 'empty_payload',
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
         attemptError = `订单历史响应为空（${nullPayloadDiagnostic(detail)}）`;
       } else if (detailBusinessFailure !== null) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史业务响应失败。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           failureReason: 'business_code',
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
         attemptError = detailBusinessFailure;
       } else if (!detailSchemaResult?.success) {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应结构校验失败。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           failureReason: 'schema_validation',
           schema: 'OrderHistoryResponseSchema',
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
         attemptError = `订单历史响应 schema 校验失败：${detailSchemaResult?.error.message ?? 'unknown error'}`;
       } else {
         await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'succeeded', '订单历史响应已解析。', {
           stage: 'order_history',
-          method: 'GET',
+          method: 'POST',
           endpoint: orderTikTokEndpointPath(historyUrl),
           orderId,
           durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('GET', historyUrl, undefined, detail),
+          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
           ...orderTikTokResponseDiagnostics(detail),
         });
         if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
@@ -2680,8 +2676,8 @@ async function processOrderHistoryBatch(
           await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
             domain: 'order_history',
             endpoint: historyUrl,
-            method: 'GET',
-            request: {},
+            method: 'POST',
+            request: { body: historyBody },
             response: { status: detail.status, body: detailPayload },
             createdAt: new Date().toISOString(),
             mainOrderId: orderId,
@@ -4622,9 +4618,12 @@ function materializePageProxyResponse(response: BoundTikTokResponse): BoundTikTo
 
 
 function isPageProxyUnavailableError(error: unknown): boolean {
-  if (error instanceof Error && error.name === 'PageProxyUnavailableError') return true;
+  if (error instanceof Error && (
+    error.name === 'PageProxyUnavailableError'
+    || error.name === 'PageProxyResponseMissingError'
+  )) return true;
   const message = error instanceof Error ? error.message : String(error);
-  return /Receiving end does not exist|Could not establish connection/i.test(message);
+  return /Receiving end does not exist|Could not establish connection|message port closed|no response was received/i.test(message);
 }
 
 
