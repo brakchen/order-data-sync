@@ -10,6 +10,7 @@ import {
   type OrderSyncSettings as OrderApiSettings,
 } from '../core/order-sync';
 import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryQuery, createOrderListRequestBody, tiktokOrderEndpointUrl } from '../core/tiktok-order-endpoints';
+import { parseSellerIdentityResponse, tiktokSellerIdentityEndpointUrl, type SellerIdentityResponseData } from '../core/tiktok-seller-endpoints';
 import { OrderGetResponseSchema, OrderHistoryResponseSchema } from '../core/tiktok-order-endpoint-schemas';
 import { isCancelledTikTokOrderRow } from '../core/tiktok-order-status';
 import {
@@ -45,6 +46,7 @@ import {
 
 type OrderPollingDomain = OrderDomainKey;
 const ORDER_PAGE_REQUEST_TIMEOUT_MS = 30_000;
+const SELLER_IDENTITY_PROBE_TIMEOUT_MS = 2_500;
 const MAX_RUNTIME_LOGS = 5_000;
 export const ORDER_SYNC_ALARMS = {
   orders: 'order-data-sync:orders',
@@ -4411,6 +4413,7 @@ async function executeTikTokRequestInBoundPage(
   signal: AbortSignal,
   method: 'GET' | 'POST' = 'POST',
   requestId: string = crypto.randomUUID(),
+  timeoutMs = ORDER_PAGE_REQUEST_TIMEOUT_MS,
 ): Promise<BoundTikTokResponse> {
   if (signal.aborted) throw new DOMException('Request aborted', 'AbortError');
   const tabsApi = globalThis.chrome?.tabs;
@@ -4420,7 +4423,7 @@ async function executeTikTokRequestInBoundPage(
       url,
       method,
       body,
-      timeoutMs: ORDER_PAGE_REQUEST_TIMEOUT_MS,
+      timeoutMs,
     };
     let abortHandler: (() => void) | undefined;
     try {
@@ -4479,7 +4482,7 @@ async function executeTikTokRequestInBoundPage(
         func: fetchTikTokResponse,
         // AbortSignal is not structured-cloneable. Pass a duration so the
         // serialized MAIN-world function can cancel its own fetch instead.
-        args: [url, body, method, ORDER_PAGE_REQUEST_TIMEOUT_MS],
+        args: [url, body, method, timeoutMs],
       });
       const aborted = new Promise<never>((_, reject) => {
         abortHandler = () => reject(new DOMException('Request aborted', 'AbortError'));
@@ -4535,16 +4538,40 @@ async function executeTikTokRequestWithTimeout(
   url: string,
   body: Record<string, unknown>,
   method: 'GET' | 'POST',
+  timeoutMs = ORDER_PAGE_REQUEST_TIMEOUT_MS,
 ): Promise<BoundTikTokResponse> {
   const controller = new AbortController();
   const release = await tiktokRequestPacer().acquire(controller.signal);
-  const timeout = setTimeout(() => controller.abort(), ORDER_PAGE_REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await executeTikTokRequestInBoundPage(tabId, url, body, controller.signal, method);
+    return await executeTikTokRequestInBoundPage(tabId, url, body, controller.signal, method, crypto.randomUUID(), timeoutMs);
   } finally {
     clearTimeout(timeout);
     release();
   }
+}
+
+export async function probeSellerIdentityInBoundPage(tabId: number): Promise<{
+  identity: SellerIdentityResponseData;
+  requestUrl: string;
+  response: BoundTikTokResponse;
+}> {
+  const requestUrl = tiktokSellerIdentityEndpointUrl();
+  const response = await executeTikTokRequestWithTimeout(
+    tabId,
+    requestUrl,
+    {},
+    'GET',
+    SELLER_IDENTITY_PROBE_TIMEOUT_MS,
+  );
+  const identity = response.ok ? parseSellerIdentityResponse(response.payload) : null;
+  if (!identity) {
+    throw Object.assign(new Error('Seller Center 店铺信息接口未返回可用身份信息。'), {
+      name: 'SellerIdentityProbeResponseError',
+      response,
+    });
+  }
+  return { identity, requestUrl, response };
 }
 
 

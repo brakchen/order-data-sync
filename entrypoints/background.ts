@@ -8,6 +8,7 @@ import {
   handleOrderSyncAlarm,
   ORDER_SYNC_ALARMS,
   pollOrderDomain,
+  probeSellerIdentityInBoundPage,
   recordOrderSyncRuntimeLog,
   reportSchedulerError,
   requestManualOrderDomainSync,
@@ -419,8 +420,6 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
     if (candidate?.id !== undefined && candidate.url) {
       try {
         await autoBindInitialSellerTab(candidate);
-        candidateFound = true;
-        continue;
       } catch (error) {
         let recovered = false;
         await mutateOrderSyncState((current) => {
@@ -440,6 +439,48 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
         });
         return;
       }
+      candidateFound = true;
+      try {
+        await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_started', 'started', '已主动请求 Seller Center 店铺信息接口。', {
+          stage: 'seller_binding',
+          tabId: candidate.id,
+          pageOrigin: new URL(candidate.url).origin,
+          requestType: 'GET',
+          endpointPath: '/api/v3/seller/common/get',
+          timeoutMs: 2_500,
+        });
+        const probe = await probeSellerIdentityInBoundPage(candidate.id);
+        const captured = await captureSellerIdentity({
+          sellerId: probe.identity.sellerId,
+          url: candidate.url,
+          ...(probe.identity.shopName ? { shopName: probe.identity.shopName } : {}),
+          ...(probe.identity.shopCode ? { shopCode: probe.identity.shopCode } : {}),
+          ...(probe.identity.shopRegion ? { shopRegion: probe.identity.shopRegion } : {}),
+          ...(probe.identity.regionCode ? { regionCode: probe.identity.regionCode } : {}),
+        }, { tab: { id: candidate.id } as chrome.tabs.Tab });
+        await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_succeeded', 'succeeded', '已主动获取并写入 Seller Center 店铺信息。', {
+          stage: 'seller_binding',
+          tabId: candidate.id,
+          sellerId: probe.identity.sellerId,
+          shopName: probe.identity.shopName ?? null,
+          shopCode: probe.identity.shopCode ?? null,
+          shopRegion: probe.identity.shopRegion ?? null,
+          regionCode: probe.identity.regionCode ?? null,
+          requestMode: probe.response.requestMode ?? null,
+          httpStatus: probe.response.status,
+          stateBound: Boolean(captured.boundTab?.sellerId),
+        });
+      } catch (error) {
+        const probeResponse = isRecord(error) && 'response' in error ? error.response : null;
+        await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_failed', 'failed', '主动获取 Seller Center 店铺信息失败，将继续等待页面被动请求捕获。', {
+          stage: 'seller_binding',
+          tabId: candidate.id,
+          error: error instanceof Error ? error.message : String(error),
+          httpStatus: isRecord(probeResponse) && typeof probeResponse.status === 'number' ? probeResponse.status : null,
+          requestMode: isRecord(probeResponse) && typeof probeResponse.requestMode === 'string' ? probeResponse.requestMode : null,
+        });
+      }
+      continue;
     }
     await new Promise((resolve) => setTimeout(resolve, AUTO_BIND_POLL_INTERVAL_MS));
   }
@@ -786,4 +827,8 @@ function reportError(error: unknown, source = 'background'): void {
     source,
     error: error instanceof Error ? error.message : String(error),
   }).catch((loggingError) => console.error('[order-data-sync] log failure', loggingError));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
