@@ -169,6 +169,11 @@ function Popup() {
 
       <section className="card">
         <div className="section-title"><h2>同步进度</h2><span className="caption">本机保存断点</span></div>
+        {state?.endpointCircuit ? <div className="critical-alert" role="alert">
+          <strong>同步已暂停：TikTok 接口持续报错</strong>
+          <span>{state.endpointCircuit.endpoint} · HTTP {state.endpointCircuit.httpStatus} · 连续 {state.endpointCircuit.consecutiveFailures} 次</span>
+          <small>已停止继续请求和上传 TTS-ERP，请人工排查接口后取消暂停并保存配置。</small>
+        </div> : null}
         <div className="next-sync"><span>下次同步</span><strong>{formatNextSync(state)}</strong></div>
         <div className="sync-actions">
           <button disabled={busy || !readyToSync} onClick={() => void sync(false)}>立即同步</button>

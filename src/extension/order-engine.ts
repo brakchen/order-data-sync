@@ -456,6 +456,13 @@ async function noteTikTokEndpointResponse(url: string, response: BoundTikTokResp
     await saveOrderSyncState({
       ...current,
       settings: { ...current.settings, syncPaused: true },
+      endpointCircuit: {
+        endpoint,
+        httpStatus: response.status,
+        consecutiveFailures: consecutive,
+        threshold: TIKTOK_ENDPOINT_HARD_FAILURE_THRESHOLD,
+        openedAt: now,
+      },
       runtimeLogs: [...current.runtimeLogs, log].slice(-MAX_RUNTIME_LOGS),
     });
   });

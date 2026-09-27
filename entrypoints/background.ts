@@ -166,6 +166,7 @@ export async function handleOrderMessage(
         return {
           ...current,
           settings,
+          ...(circuitResetRequested ? { endpointCircuit: null } : {}),
           ...(autoBindingCancelled ? {
             sellerBinding: { mode: 'idle' as const, outcome: 'none' as const, deadlineAt: null },
           } : {}),

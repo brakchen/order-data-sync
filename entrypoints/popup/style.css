@@ -33,6 +33,9 @@ button.secondary { border: 1px solid #dce5e1; color: #315f51; background: #f7faf
 dl { display: flex; justify-content: space-between; margin: 0 0 12px; font-size: 11px; }
 dt { color: #79857f; } dd { max-width: 225px; margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .domain-list { margin-top: 10px; }
+.critical-alert { display: grid; gap: 4px; margin: 10px 0; padding: 10px 11px; border: 1px solid #e35c4f; border-radius: 8px; color: #8e241b; background: #fff0ee; font-size: 11px; }
+.critical-alert strong { color: #a52c21; font-size: 12px; }
+.critical-alert span, .critical-alert small { color: #9e4b43; font-size: 10px; }
 .domain-row { display: grid; grid-template-columns: 70px 1fr; gap: 4px 8px; padding: 10px 0; border-top: 1px solid #eef1ef; font-size: 11px; }
 .domain-row strong { grid-column: 1; grid-row: 1; }
 .domain-row span { justify-self: end; color: #5d6a64; }

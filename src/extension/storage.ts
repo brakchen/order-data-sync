@@ -1,5 +1,5 @@
 import { ORDER_RUNTIME_LOG_LIMIT, ORDER_SYNC_STATE_KEY, createDefaultOrderSettings, normalizeOrderSyncSettings } from '../core/settings';
-import type { OrderBoundTab, OrderDomainKey, OrderDomainProgress, OrderDomainProgressRow, OrderListCheckpoint, OrderRuntimeLog, OrderSyncState, SellerBindingState } from '../core/types';
+import type { OrderBoundTab, OrderDomainKey, OrderDomainProgress, OrderDomainProgressRow, OrderListCheckpoint, OrderRuntimeLog, OrderSyncState, SellerBindingState, TikTokEndpointCircuit } from '../core/types';
 
 export function createDefaultOrderProgress(): OrderDomainProgress {
   const row = (): OrderDomainProgressRow => ({
@@ -58,6 +58,7 @@ export function createDefaultOrderSyncState(now = new Date().toISOString()): Ord
     boundTab: null,
     sellerBinding: { mode: 'idle', outcome: 'none', deadlineAt: null },
     shopRegion: null,
+    endpointCircuit: null,
     orderProgress: createDefaultOrderProgress(),
     runtimeLogs: [],
     createdAt: now,
@@ -111,10 +112,27 @@ export function normalizeOrderSyncState(value: unknown): OrderSyncState {
     boundTab: normalizeBoundTab(value.boundTab),
     sellerBinding: normalizeSellerBinding(value.sellerBinding),
     shopRegion: normalizeShopRegion(value.shopRegion),
+    endpointCircuit: normalizeEndpointCircuit(value.endpointCircuit),
     orderProgress: normalizeOrderProgress(value.orderProgress),
     runtimeLogs: normalizeRuntimeLogs(value.runtimeLogs),
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : base.createdAt,
     updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : base.updatedAt,
+  };
+}
+
+function normalizeEndpointCircuit(value: unknown): TikTokEndpointCircuit | null {
+  if (!isRecord(value)
+    || typeof value.endpoint !== 'string'
+    || typeof value.httpStatus !== 'number'
+    || typeof value.consecutiveFailures !== 'number'
+    || typeof value.threshold !== 'number'
+    || typeof value.openedAt !== 'string') return null;
+  return {
+    endpoint: value.endpoint,
+    httpStatus: value.httpStatus,
+    consecutiveFailures: value.consecutiveFailures,
+    threshold: value.threshold,
+    openedAt: value.openedAt,
   };
 }
 

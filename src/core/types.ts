@@ -96,6 +96,14 @@ export interface SellerBindingState {
   deadlineAt: string | null;
 }
 
+export interface TikTokEndpointCircuit {
+  endpoint: string;
+  httpStatus: number;
+  consecutiveFailures: number;
+  threshold: number;
+  openedAt: string;
+}
+
 export interface OrderShopRegion {
   sellerId: string;
   baseUrl: string;
@@ -116,6 +124,7 @@ export interface OrderSyncState {
   boundTab: OrderBoundTab | null;
   sellerBinding: SellerBindingState;
   shopRegion: OrderShopRegion | null;
+  endpointCircuit?: TikTokEndpointCircuit | null;
   orderProgress: OrderDomainProgress;
   runtimeLogs: OrderRuntimeLog[];
   createdAt: string;
