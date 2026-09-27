@@ -383,6 +383,8 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
   let lastSearchError: string | null = null;
   let searchErrorLogged = false;
   let candidateFound = Boolean(activated.boundTab);
+  const failedCandidateTabIds = new Set<number>();
+  let retryFailedCandidatesAt = 0;
   while (Date.now() < deadlineAt && runId === autoBindingRunId) {
     const bindingState = await getOrderSyncState();
     if (bindingState.sellerBinding.mode !== 'auto') return;
@@ -408,7 +410,14 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
 
     let candidate: chrome.tabs.Tab | null = null;
     try {
-      candidate = await findAutomaticSellerTab();
+      candidate = await findAutomaticSellerTab(failedCandidateTabIds);
+      if (!candidate && failedCandidateTabIds.size > 0 && Date.now() >= retryFailedCandidatesAt) {
+        // A transient page-proxy failure should not wait for the five-minute
+        // watcher. Retry the failed page after a short backoff, while still
+        // giving other candidate tabs priority during the current run.
+        failedCandidateTabIds.clear();
+        candidate = await findAutomaticSellerTab();
+      }
     } catch (error) {
       lastSearchError = error instanceof Error ? error.message : String(error);
       if (!searchErrorLogged) {
@@ -421,6 +430,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
     }
     if (runId !== autoBindingRunId) return;
     if (candidate?.id !== undefined && candidate.url) {
+      const candidateTabId = candidate.id;
       try {
         await autoBindInitialSellerTab(candidate);
       } catch (error) {
@@ -431,19 +441,49 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
           return {
             ...current,
             boundTab: current.boundTab?.sellerId ? current.boundTab : null,
-            sellerBinding: { mode: 'idle', outcome: 'failed', deadlineAt: null },
           };
         });
-        if (recovered) await ensureBoundAlarms('configuration_ready');
-        await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_failed', 'failed', '本轮自动绑定 Seller Center 页面失败，将按定时扫描继续重试。', {
+        if (!recovered) return;
+        failedCandidateTabIds.add(candidateTabId);
+        retryFailedCandidatesAt = Date.now() + 500;
+        await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_candidate_failed', 'failed', '当前候选 Seller Center 页面绑定失败，将继续尝试其他页面或短暂退避后重试。', {
           stage: 'seller_binding',
-          tabId: candidate.id,
+          tabId: candidateTabId,
           error: error instanceof Error ? error.message : String(error),
+          retryInMs: 500,
+          triedCandidateCount: failedCandidateTabIds.size,
+        });
+        continue;
+      }
+      candidateFound = true;
+      const captured = await probeAndCaptureSellerIdentity(candidate);
+      if (captured) {
+        await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_completed', 'succeeded', '自动绑定已完成，并成功捕获 Seller ID。', {
+          stage: 'seller_binding',
+          candidateFound: true,
+          sellerIdCaptured: true,
+          tabId: candidate.id,
         });
         return;
       }
-      candidateFound = true;
-      await probeAndCaptureSellerIdentity(candidate);
+      failedCandidateTabIds.add(candidateTabId);
+      retryFailedCandidatesAt = Date.now() + 500;
+      let clearedCandidate = false;
+      await mutateOrderSyncState((current) => {
+        if (current.sellerBinding.mode !== 'auto'
+          || current.boundTab?.tabId !== candidateTabId
+          || current.boundTab?.sellerId) return current;
+        clearedCandidate = true;
+        return { ...current, boundTab: null };
+      });
+      if (clearedCandidate) await ensureBoundAlarms('configuration_ready');
+      await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_candidate_failed', 'failed', '当前页面未获取到 Seller ID，将继续尝试其他页面或短暂退避后重试。', {
+        stage: 'seller_binding',
+        tabId: candidateTabId,
+        reason: 'seller_id_probe_failed',
+        retryInMs: 500,
+        triedCandidateCount: failedCandidateTabIds.size,
+      });
       continue;
     }
     await new Promise((resolve) => setTimeout(resolve, AUTO_BIND_POLL_INTERVAL_MS));
@@ -477,11 +517,11 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
   });
 }
 
-async function findAutomaticSellerTab(): Promise<chrome.tabs.Tab | null> {
+async function findAutomaticSellerTab(excludedTabIds: ReadonlySet<number> = new Set()): Promise<chrome.tabs.Tab | null> {
   const tabs = await chrome.tabs.query({});
   const sellerTabs = tabs
     .filter((tab) => tab.id !== undefined && tab.url && isSellerCenterUrl(tab.url)
-      && !isTikTokLoginPage(tab.url));
+      && !isTikTokLoginPage(tab.url) && !excludedTabIds.has(tab.id!));
   const pinnedSellerTabs = sellerTabs.filter((tab) => tab.pinned === true);
   const candidatePool = pinnedSellerTabs.length > 0 ? pinnedSellerTabs : sellerTabs;
   const candidate = candidatePool

@@ -4591,7 +4591,10 @@ async function executeTikTokRequestInBoundPage(
         func: fetchTikTokResponse,
         // AbortSignal is not structured-cloneable. Pass a duration so the
         // serialized MAIN-world function can cancel its own fetch instead.
-        args: [url, body, method, timeoutMs, undefined, true, {
+        // Keep every argument structured-cloneable. In particular, an
+        // explicit undefined here makes Chrome reject the whole injection
+        // before the Seller Center request is executed.
+        args: [url, body, method, timeoutMs, null, true, {
           storageKey: SELLER_PAGE_COORDINATION_KEY,
           requestId,
           leaseMs: SELLER_PAGE_REQUEST_LEASE_MS,

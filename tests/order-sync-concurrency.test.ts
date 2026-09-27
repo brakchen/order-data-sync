@@ -112,6 +112,8 @@ describe('order domain concurrent scope changes', () => {
     await handleOrderSyncAlarm();
 
     expect(chrome.scripting.executeScript).toHaveBeenCalled();
+    const injection = vi.mocked(chrome.scripting.executeScript).mock.calls[0]?.[0];
+    expect(injection?.args?.[4]).toBeNull();
   });
 
   it('does not upload an old seller page into the newly bound seller', async () => {

@@ -31,8 +31,8 @@ export async function fetchTikTokResponse(
   requestUrl: string,
   requestBody: Record<string, unknown>,
   method: 'GET' | 'POST' = 'POST',
-  signalOrTimeoutMs?: AbortSignal | number,
-  timeoutMs?: number,
+  signalOrTimeoutMs?: AbortSignal | number | null,
+  timeoutMs?: number | null,
   parseResponse = true,
   coordination?: SellerPageRequestCoordination,
 ): Promise<BoundTikTokResponse> {
@@ -65,8 +65,12 @@ export async function fetchTikTokResponse(
       // The request still runs; refresh claiming fails closed when shared storage is unavailable.
     }
   }
-  const signal = typeof signalOrTimeoutMs === 'number' ? undefined : signalOrTimeoutMs;
-  const pageTimeoutMs = typeof signalOrTimeoutMs === 'number' ? signalOrTimeoutMs : timeoutMs;
+  // The MAIN-world executeScript path cannot receive undefined in its args
+  // array. It passes null for this unused AbortSignal slot instead.
+  const signal = typeof signalOrTimeoutMs === 'number' || signalOrTimeoutMs === null
+    ? undefined : signalOrTimeoutMs;
+  const pageTimeoutMs = typeof signalOrTimeoutMs === 'number'
+    ? signalOrTimeoutMs : timeoutMs ?? undefined;
   const pageController = pageTimeoutMs !== undefined && Number.isFinite(pageTimeoutMs) && pageTimeoutMs > 0
     ? new AbortController()
     : undefined;
