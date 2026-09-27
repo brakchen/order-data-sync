@@ -1357,7 +1357,7 @@ describe('物流域（N+1，逐单详情）', () => {
 
     await pollOrderDomain('logistics');
 
-    expect(requestedMethods).toEqual(['POST', 'POST']);
+    expect(requestedMethods).toEqual(['POST', 'GET']);
     expect(requested[1]).toContain('main_order_id=active');
     expect(requested[1]).not.toContain('main_order_id=cancelled');
     expect(uploadsForDomain('logistics').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
@@ -1654,6 +1654,43 @@ describe('订单详情与历史域（N+1，逐单接口）', () => {
     expect(requestedMethods).toEqual(['POST', 'POST']);
   });
 
+  it('dumps 失败不停止当前批次，并把订单放入续传队列', async () => {
+    stubFetch(['o1', 'o2']);
+    mocks.uploadDump
+      .mockRejectedValueOnce(new OrderSyncError('RETRYABLE', 'dumps 暂时不可用', 400, undefined, 'dump'))
+      .mockResolvedValue({ requestId: 'req-retry' });
+
+    const first = pollOrderDomain('order_details');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await first;
+
+    expect(mocks.uploadDump).toHaveBeenCalledTimes(2);
+    expect(state.orderProgress?.domains.order_details).toMatchObject({
+      uploaded: 1,
+      pending: 1,
+      failed: 1,
+      failedOrderIds: ['o1'],
+      resumeOrderId: 'o1',
+    });
+    expect(alarms.get('order-data-sync:order-details:continue')?.delayInMinutes).toBe(0.1);
+    expect(state.runtimeLogs.some((log) => log.context?.details?.action === 'order_failed'
+      && log.context?.details?.orderId === 'o1'
+      && log.context?.details?.retryQueued === true
+      && log.context?.details?.retryQueue === 'pendingOrderIds')).toBe(true);
+
+    const retry = pollOrderDomain('order_details');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await retry;
+
+    expect(mocks.uploadDump).toHaveBeenCalledTimes(3);
+    expect(state.orderProgress?.domains.order_details).toMatchObject({
+      pending: 0,
+      failed: 0,
+      failedOrderIds: [],
+      resumeOrderId: null,
+    });
+  });
+
   it('order/history 的 HTTP 200 + code=0 但结构无效时不上传', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
       const url = String(input);
@@ -1675,7 +1712,7 @@ describe('订单详情与历史域（N+1，逐单接口）', () => {
     await pollOrderDomain('order_history');
 
     expect(requested[1]).toContain('https://seller.tiktokglobalshop.com/');
-    expect(requestedMethods).toEqual(['POST', 'GET']);
+    expect(requestedMethods).toEqual(['POST', 'POST']);
     expect(mocks.uploadDump).not.toHaveBeenCalled();
     expect(state.orderProgress?.domains.order_history).toMatchObject({
       pending: 1,

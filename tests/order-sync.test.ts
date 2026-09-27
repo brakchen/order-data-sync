@@ -269,13 +269,13 @@ describe("uploadOrderSyncDump", () => {
     expect(result).toEqual({ requestId: "req-5" });
   });
 
-  it("throws PERMANENT on 400", async () => {
+  it("classifies dump 400 as RETRYABLE for the outer pending queue", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(
       response({ code: "BAD_REQUEST", message: "invalid" }, 400),
     );
     await expect(
       uploadOrderSyncDump(settings, scope, dump, { fetchImpl }),
-    ).rejects.toMatchObject({ code: "PERMANENT", httpStatus: 400 });
+    ).rejects.toMatchObject({ code: "RETRYABLE", httpStatus: 400, operation: "dump" });
   });
 
   it("throws PERMANENT on 413", async () => {

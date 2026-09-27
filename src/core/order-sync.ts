@@ -336,7 +336,10 @@ export async function uploadOrderSyncDump(
       throw withRequestDiagnostics(syncError, url, requestId, attempt + 1, uploadStartedAt, lastAttemptStartedAt);
     }
     if (response.status === 400) {
-      const syncError = new OrderSyncError('PERMANENT', undefined, 400, undefined, 'dump', undefined);
+      // dumps 的 400 可能来自服务端尚未部署对应域路由或暂时性的契约不一致。
+      // 交给上层订单域 pendingOrderIds 队列续传，不能把单条数据判成永久失败。
+      const diagnostic = await responseDiagnostic(response, 'dump');
+      const syncError = new OrderSyncError('RETRYABLE', undefined, 400, diagnostic, 'dump', undefined);
       throw withRequestDiagnostics(syncError, url, requestId, attempt + 1, uploadStartedAt, lastAttemptStartedAt);
     }
     if (response.status === 429 || response.status >= 500) {

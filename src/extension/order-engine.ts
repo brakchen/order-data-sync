@@ -628,6 +628,11 @@ function orderRequestExceptionDetails(error: unknown): Record<string, unknown> {
   if (typeof error.code === 'string') details.syncErrorCode = error.code.slice(0, 64);
   if (typeof error.httpStatus === 'number' && Number.isFinite(error.httpStatus)) details.httpStatus = error.httpStatus;
   if (typeof error.operation === 'string') details.operation = error.operation.slice(0, 64);
+  if (error.operation === 'dump') {
+    details.retryQueued = true;
+    details.retryQueue = 'pendingOrderIds';
+    details.retryMechanism = 'order-domain-continuation-alarm';
+  }
   if (typeof error.transportFailure === 'string') details.transportFailure = error.transportFailure.slice(0, 32);
   if (isRecord(error.requestDiagnostics)) {
     const requestDiagnostics = error.requestDiagnostics;
@@ -1747,6 +1752,7 @@ async function processOrderDomainBatch(
         orderId: entry.displayId,
         orderIndex: entry.index,
         error: sanitizeDiagnosticText(lastError).slice(0, 240),
+        ...orderRequestExceptionDetails(error),
       });
     }
 
@@ -1891,6 +1897,7 @@ async function processLogisticsBatch(
     });
 
     let attemptError: string | null = null;
+    let attemptFailure: unknown = null;
     try {
       if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('logistics', state)) {
         stopped = true;
@@ -2022,6 +2029,7 @@ async function processLogisticsBatch(
         stopped = true;
         break;
       }
+      attemptFailure = error;
       attemptError = error instanceof Error ? error.message : String(error);
     }
 
@@ -2052,6 +2060,7 @@ async function processLogisticsBatch(
         orderId,
         orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
         error: sanitizeDiagnosticText(attemptError).slice(0, 240),
+        ...orderRequestExceptionDetails(attemptFailure),
       });
     } else {
       const pendingIndex = pendingKeys.indexOf(orderId);
@@ -2224,6 +2233,7 @@ async function processOrderDetailsBatch(
     });
 
     let attemptError: string | null = null;
+    let attemptFailure: unknown = null;
     try {
       if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_details', state)) {
         stopped = true;
@@ -2367,6 +2377,7 @@ async function processOrderDetailsBatch(
         stopped = true;
         break;
       }
+      attemptFailure = error;
       attemptError = error instanceof Error ? error.message : String(error);
     }
 
@@ -2397,6 +2408,7 @@ async function processOrderDetailsBatch(
         orderId,
         orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
         error: sanitizeDiagnosticText(attemptError).slice(0, 240),
+        ...orderRequestExceptionDetails(attemptFailure),
       });
     } else {
       const pendingIndex = pendingKeys.indexOf(orderId);
@@ -2568,6 +2580,7 @@ async function processOrderHistoryBatch(
     });
 
     let attemptError: string | null = null;
+    let attemptFailure: unknown = null;
     try {
       if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
         stopped = true;
@@ -2711,6 +2724,7 @@ async function processOrderHistoryBatch(
         stopped = true;
         break;
       }
+      attemptFailure = error;
       attemptError = error instanceof Error ? error.message : String(error);
     }
 
@@ -2741,6 +2755,7 @@ async function processOrderHistoryBatch(
         orderId,
         orderIndex: orderIndex >= 0 ? orderIndex + 1 : null,
         error: sanitizeDiagnosticText(attemptError).slice(0, 240),
+        ...orderRequestExceptionDetails(attemptFailure),
       });
     } else {
       const pendingIndex = pendingKeys.indexOf(orderId);
