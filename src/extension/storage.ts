@@ -41,7 +41,14 @@ export function createDefaultOrderProgress(): OrderDomainProgress {
   return {
     status: 'idle',
     lastRunAt: null,
-    domains: { orders: row(), logistics: row(), statements: row(), order_details: row(), order_history: row() },
+    domains: {
+      orders: row(),
+      logistics: row(),
+      statements: row(),
+      after_sales: row(),
+      order_details: row(),
+      order_history: row(),
+    },
   };
 }
 
@@ -130,6 +137,7 @@ function normalizeOrderProgress(value: unknown): OrderDomainProgress {
     const row = domains[key];
     if (isRecord(row)) base.domains[key] = normalizeProgressRow(row);
   }
+  if (isRecord(domains.after_sales)) base.domains.after_sales = normalizeProgressRow(domains.after_sales);
   base.status = value.status === 'running' || value.status === 'ok' || value.status === 'partial'
     ? value.status : 'idle';
   base.lastRunAt = typeof value.lastRunAt === 'string' ? value.lastRunAt : null;

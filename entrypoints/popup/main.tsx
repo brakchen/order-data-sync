@@ -2,12 +2,13 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createDefaultOrderSettings } from '../../src/core/settings';
 import type { OrderExtensionMessage } from '../../src/extension/messages';
-import type { OrderDomainKey, OrderSyncSettings, OrderSyncState } from '../../src/core/types';
+import type { OrderDisplayDomainKey, OrderSyncSettings, OrderSyncState } from '../../src/core/types';
 import './style.css';
 
 type Reply<T> = { ok: true; data: T } | { ok: false; error: string };
-const DOMAIN_LABELS: Record<OrderDomainKey, string> = {
+const DOMAIN_LABELS: Record<OrderDisplayDomainKey, string> = {
   orders: '订单', logistics: '物流', statements: '结算',
+  after_sales: '售后',
   order_details: '订单详情', order_history: '订单历史',
 };
 
@@ -113,7 +114,7 @@ function Popup() {
     && state.settings.orderDomainSyncEnabled && !state.settings.syncPaused);
   const automaticBinding = state?.sellerBinding.mode === 'auto';
   const automaticBindingTimedOut = state?.sellerBinding.outcome === 'timeout';
-  const hasFailures = (['orders', 'logistics', 'statements'] as const).some((domain) => {
+  const hasFailures = (['orders', 'logistics', 'statements', 'after_sales'] as const).some((domain) => {
     const row = state?.orderProgress.domains[domain];
     return Boolean(row && (row.lastError || row.pending > 0 || (row.failed ?? 0) > 0
       || row.syncRunStatus === 'partial_failed' || row.syncRunStatus === 'interrupted'));
@@ -166,12 +167,12 @@ function Popup() {
             onClick={() => void sync(true)}>重试失败项</button> : null}
         </div>
         <div className="domain-list">
-          {(['orders', 'logistics', 'statements'] as const).map((domain) => {
+          {(['orders', 'logistics', 'statements', 'after_sales'] as const).map((domain) => {
             const row = state?.orderProgress.domains[domain];
             return <div className="domain-row" key={domain}>
               <strong>{DOMAIN_LABELS[domain]}</strong>
               <span>{row?.syncRunStatus === 'running' ? '同步中' : row?.lastSuccessAt ? `最近成功 ${formatTime(row.lastSuccessAt)}` : '等待同步'}</span>
-              <small>已上传 {row?.uploaded ?? 0} · 待处理 {row?.pending ?? 0} · 失败 {row?.failed ?? 0}</small>
+              <small>{domain === 'orders' ? `订单数 ${orderTotal(row)} · ` : ''}已上传 {row?.uploaded ?? 0} · 待处理 {row?.pending ?? 0} · 失败 {row?.failed ?? 0}</small>
               {row?.lastError ? <small className="error">{row.lastError}</small> : null}
               {row?.syncRunStatus === 'running' && Date.now() - Date.parse(row.lastProgressAt ?? '') > 2 * 60_000
                 ? <button className="stop-button" disabled={busy} onClick={() => void run(
@@ -204,7 +205,7 @@ function formatNextSync(state: OrderSyncState | null): string {
   if (!state) return '加载中…';
   if (state.orderProgress.status === 'running') return '同步进行中';
   if (state.settings.syncPaused || !state.settings.orderDomainSyncEnabled) return '已暂停';
-  const rows = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const)
+  const rows = (['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history'] as const)
     .map((domain) => state.orderProgress.domains[domain]);
   if (rows.some((row) => (row.pending ?? 0) > 0
     || (row.failed ?? 0) > 0
@@ -219,6 +220,11 @@ function formatNextSync(state: OrderSyncState | null): string {
   if (rows.some((row) => row.lastError != null || row.syncRunStatus === 'partial_failed')) return '等待重试';
   if (!state.boundTab?.sellerId || !state.settings.syncToken.trim()) return '等待配置';
   return '首次同步准备中';
+}
+
+function orderTotal(row: OrderSyncState['orderProgress']['domains']['orders'] | undefined): number {
+  if (!row) return 0;
+  return Math.max(0, row.serverTotal ?? row.total ?? 0);
 }
 
 function formatFileTimestamp(value: Date): string {
