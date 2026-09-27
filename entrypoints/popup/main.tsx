@@ -30,6 +30,7 @@ function Popup() {
   const [notice, setNotice] = useState('');
   const settingsInitialized = useRef(false);
   const lastSavedSettings = useRef('');
+  const draftTouched = useRef(false);
 
   const refresh = async (updateDraft = false) => {
     try {
@@ -38,7 +39,7 @@ function Popup() {
       if (updateDraft) {
         settingsInitialized.current = true;
         lastSavedSettings.current = serializeSettings(result.settings);
-        setDraft(result.settings);
+        if (!draftTouched.current) setDraft(result.settings);
       }
     } catch (error) {
       setNotice(toMessage(error));
@@ -67,6 +68,7 @@ function Popup() {
       if (updateDraft) {
         settingsInitialized.current = true;
         lastSavedSettings.current = serializeSettings(next.settings);
+        draftTouched.current = false;
         setDraft(next.settings);
       }
       setNotice(success);
@@ -77,24 +79,25 @@ function Popup() {
     }
   };
 
-  const save = () => run(
-    () => send<OrderSyncState>({ type: 'order-sync:save-settings', settings: draft }),
-    '配置已保存。',
+  const saveDraftSettings = (settings: OrderSyncSettings, success: string) => run(
+    () => send<OrderSyncState>({ type: 'order-sync:save-settings', settings }),
+    success,
     true,
   );
+  const save = () => saveDraftSettings(draft, '配置已保存。');
   useEffect(() => {
     if (!settingsInitialized.current) return undefined;
     const serialized = serializeSettings(draft);
     if (serialized === lastSavedSettings.current) return undefined;
     const timer = window.setTimeout(() => {
-      void run(
-        () => send<OrderSyncState>({ type: 'order-sync:save-settings', settings: draft }),
-        '配置已自动保存。',
-        true,
-      );
+      void saveDraftSettings(draft, '配置已自动保存。');
     }, 600);
     return () => window.clearTimeout(timer);
-  }, [draft]);
+  }, [draft, state]);
+  const updateDraft = (next: OrderSyncSettings) => {
+    draftTouched.current = true;
+    setDraft(next);
+  };
   const sync = (retryFailedOnly: boolean) => run(
     () => send<OrderSyncState>({ type: 'order-sync:sync-domains', retryFailedOnly }),
     retryFailedOnly ? '失败项已加入同步队列。' : '订单域各接口同步已启动。',
@@ -142,15 +145,16 @@ function Popup() {
         <h2>下游配置</h2>
         <label>同步地址
           <input type="url" value={draft.syncBaseUrl} placeholder="https://example.com/tts"
-            onChange={(event) => setDraft({ ...draft, syncBaseUrl: event.target.value })} />
+            onChange={(event) => updateDraft({ ...draft, syncBaseUrl: event.target.value })} />
         </label>
         <label>访问令牌
           <input type="password" value={draft.syncToken} autoComplete="off" placeholder="Bearer token"
-            onChange={(event) => setDraft({ ...draft, syncToken: event.target.value })} />
+            onChange={(event) => updateDraft({ ...draft, syncToken: event.target.value })}
+            onBlur={() => void saveDraftSettings(draft, '访问令牌已自动保存。')} />
         </label>
         <label className="check-row">
           <input type="checkbox" checked={!draft.orderDomainSyncEnabled}
-            onChange={(event) => setDraft({ ...draft, orderDomainSyncEnabled: !event.target.checked })} />
+            onChange={(event) => updateDraft({ ...draft, orderDomainSyncEnabled: !event.target.checked })} />
           <span>暂停自动采集</span>
         </label>
         <button className="secondary" disabled={busy} onClick={() => void save()}>保存配置</button>
