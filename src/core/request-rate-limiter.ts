@@ -14,7 +14,7 @@ export const ACCELERATED_REQUEST_MAX_QPS = 8;
 export const ACCELERATED_REQUEST_INTERVAL_MS = 1_000 / ACCELERATED_REQUEST_MAX_QPS;
 export const ACCELERATED_REQUEST_MAX_IN_FLIGHT = 8;
 // 0.1.150：删 CURSOR_REQUEST_* 和 createTokenBucketRateLimiter（死件）。
-// 2026-09-02 dump-architecture 改造把 /cursor 从「正查」降级成 has-data 预检
+// 2026-09-02 dump-architecture 改造把 /cursor 从「正查」降级成预检
 // （只返 1 行 true/false），500 QPS / 100 in-flight 的限流器从此再没人 acquire。
 
 export type ReleaseRequestSlot = () => void;

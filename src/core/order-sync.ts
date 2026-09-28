@@ -6,20 +6,16 @@
  * Seller Center page captures.
  *
  * Protocol contract:
- * - POST /v2/order-sync/has-data — bulk coverage check (which order_ids already synced)
  * - POST /v2/order-sync/dumps   — single dump upload (inline parse on server)
  * - POST /v2/order-sync/reconcile — one reconciliation query for order and logistics state
  */
 
 import {
-  HasDataRequestSchema,
-  HasDataResponseSchema,
   OrderSyncDumpRequestSchema,
   OrderSyncDumpResponseSchema,
   OrderSyncReconcileRequestSchema,
   OrderSyncReconcileResponseSchema,
   type OrderSyncDomain,
-  type HasDataRequest,
   type OrderSyncDumpRequest,
   type OrderSyncReconcileRequest,
   type OrderSyncReconcileResponse,
@@ -51,7 +47,7 @@ export interface OrderSyncScope {
 export type OrderSyncErrorCode = 'NETWORK' | 'RETRYABLE' | 'PERMANENT' | 'PROTOCOL';
 
 export interface SafeServerDiagnostic {
-  operation: 'has-data' | 'dump' | 'reconcile';
+  operation: 'dump' | 'reconcile';
   httpStatus: number;
   serverCode?: string;
   serverRequestId?: string;
@@ -79,7 +75,7 @@ export class OrderSyncError extends Error {
     message = '订单同步暂不可用',
     public readonly httpStatus?: number,
     public readonly diagnostic?: SafeServerDiagnostic,
-    public readonly operation?: 'has-data' | 'dump' | 'reconcile',
+    public readonly operation?: 'dump' | 'reconcile',
     public readonly transportFailure?: 'network' | 'timeout',
   ) {
     super(message);
@@ -132,11 +128,6 @@ function withRequestDiagnostics(
 export type DumpUploadStatus = 'inserted';  // 其他状态作废（strict HTTP 语义下）
 // NOTE: DumpUploadStatus 保留为类型文档；当前无 production code 使用它。
 
-export interface HasDataResult {
-  domain: OrderSyncDomain;
-  covered: Record<string, boolean>;
-}
-
 /**
  * `/v2/order-sync/dumps` 成功响应的 `data`。
  *
@@ -181,87 +172,6 @@ export function createOrderSyncDump(
 }
 
 export type OrderSyncReconcileResult = OrderSyncReconcileResponse['data'];
-
-// ─────────────────────────────────────────────────────────────────
-// hasDataBulk — POST /v2/order-sync/has-data
-// ─────────────────────────────────────────────────────────────────
-
-export async function hasDataBulk(
-  settings: OrderSyncSettings,
-  scope: OrderSyncScope,
-  domain: OrderSyncDomain,
-  ids: string[],
-  options: {
-    fetchImpl?: FetchLike;
-    signal?: AbortSignal;
-    requestId?: string;
-    versions?: Record<string, number | number[]>;
-  } = {},
-): Promise<HasDataResult> {
-  const syncToken = settings.syncToken.trim();
-  if (!syncToken) {
-    throw new OrderSyncError('PERMANENT', '同步令牌未配置', undefined, undefined, 'has-data');
-  }
-  const fetchImpl = options.fetchImpl ?? defaultFetch;
-  const requestId = options.requestId ?? crypto.randomUUID();
-
-  const payload: HasDataRequest = {
-    scope,
-    domain,
-    ids,
-    ...(options.versions ? { versions: options.versions } : {}),
-  };
-  HasDataRequestSchema.parse(payload);
-
-  const url = new URL('v2/order-sync/has-data', normaliseBaseUrl(settings.syncBaseUrl));
-  const requestStartedAt = Date.now();
-
-  let response: Response;
-  try {
-    response = await request(fetchImpl, url, {
-      method: 'POST',
-      headers: {
-        ...scopeHeaders(settings),
-        'content-type': 'application/json',
-        'x-protocol-version': String(ORDER_SYNC_PROTOCOL_VERSION),
-        'x-request-id': requestId,
-      },
-      body: JSON.stringify(payload),
-      ...(options.signal ? { signal: options.signal } : {}),
-    });
-  } catch (error) {
-    if (isAborted(options.signal, error)) throw abortError();
-    const syncError = new OrderSyncError(
-      'NETWORK', undefined, undefined, undefined, 'has-data', transportFailureKind(error),
-    );
-    throw withRequestDiagnostics(syncError, url, requestId, 1, requestStartedAt, requestStartedAt, error);
-  }
-
-  if (!response.ok) {
-    const syncError = await responseError(response, 'has-data');
-    throw withRequestDiagnostics(syncError, url, requestId, 1, requestStartedAt, requestStartedAt);
-  }
-  try {
-    return parseHasDataResponse(await response.json(), domain);
-  } catch (error) {
-    if (error instanceof OrderSyncError) {
-      throw withRequestDiagnostics(error, url, requestId, 1, requestStartedAt, requestStartedAt);
-    }
-    throw error;
-  }
-}
-
-function parseHasDataResponse(value: unknown, expectedDomain: OrderSyncDomain): HasDataResult {
-  const parsed = HasDataResponseSchema.safeParse(value);
-  if (!parsed.success || parsed.data.code !== 0 || parsed.data.data.domain !== expectedDomain) {
-    throw new OrderSyncError('PROTOCOL', 'has-data 响应 envelope 无效');
-  }
-  const { data } = parsed.data;
-  return {
-    domain: data.domain,
-    covered: data.covered,
-  };
-}
 
 // ─────────────────────────────────────────────────────────────────
 // uploadOrderSyncDump — POST /v2/order-sync/dumps
@@ -527,7 +437,7 @@ function transportFailureKind(error: unknown): 'network' | 'timeout' {
 
 async function responseError(
   response: Response,
-  operation: 'has-data' | 'dump' | 'reconcile',
+  operation: 'dump' | 'reconcile',
 ): Promise<OrderSyncError> {
   // 429 (Too Many Requests) 是 transient，与 5xx 同列 RETRYABLE；
   // 原实现把 429 判 PERMANENT 会让查询路径的限流立即放弃同步，
@@ -543,7 +453,7 @@ async function responseError(
 
 async function responseDiagnostic(
   response: Response,
-  operation: 'has-data' | 'dump' | 'reconcile',
+  operation: 'dump' | 'reconcile',
 ): Promise<SafeServerDiagnostic> {
   let value: unknown;
   try {

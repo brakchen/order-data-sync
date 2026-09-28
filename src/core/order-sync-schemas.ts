@@ -2,7 +2,6 @@
  * Zod schemas for the order-sync protocol (tts-erp /v2/order-sync/*).
  *
  * These validate the wire shapes for:
- * - POST /v2/order-sync/has-data  (bulk coverage check)
  * - POST /v2/order-sync/dumps     (single dump upload)
  * - POST /v2/order-sync/reconcile (orders + logistics reconciliation state)
  *
@@ -11,35 +10,6 @@
  */
 
 import { z } from 'zod';
-
-// ─── has-data request / response ────────────────────────────────────
-
-export const HasDataRequestSchema = z.object({
-  scope: z.object({
-    sellerId: z.string().min(1).max(128),
-    shopId: z.string().min(1).max(128),
-  }),
-  domain: z.enum(['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history']),
-  ids: z.array(z.string().min(1)).min(1).max(500),
-  // 结算域的唯一键还包含 statement_version；缺省表示兼容旧客户端的 ID-only 语义。
-  versions: z.record(
-    z.string(),
-    z.union([z.number().int(), z.array(z.number().int())]),
-  ).optional(),
-});
-
-export type HasDataRequest = z.infer<typeof HasDataRequestSchema>;
-
-export const HasDataResponseSchema = z.object({
-  code: z.number(),
-  requestId: z.string().optional(),
-  data: z.object({
-    domain: z.enum(['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history']),
-    covered: z.record(z.string(), z.boolean()),
-  }),
-});
-
-export type HasDataResponse = z.infer<typeof HasDataResponseSchema>;
 
 // ─── dump upload request / response ─────────────────────────────────
 

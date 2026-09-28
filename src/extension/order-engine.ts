@@ -3,7 +3,6 @@
 import {
   createOrderSyncDump,
   fetchOrderSyncReconciliation,
-  hasDataBulk,
   uploadOrderSyncDump,
   type OrderSyncReconcileResult,
   type OrderSyncScope,
@@ -280,8 +279,6 @@ const ORDER_DOMAIN_BATCH_SIZE = 50;
 const ORDER_LIST_PAGE_SIZE = 20;
 
 const STATEMENT_LIST_PAGE_SIZE = 50;
-
-const ORDER_HAS_DATA_MAX_IDS = 500;
 
 const MAX_ORDER_LIST_PAGES = 500;
 
@@ -890,54 +887,6 @@ function isExactOrderAuditDue(checkpoint: OrderListCheckpoint | null | undefined
 }
 
 
-async function filterOrderRowsByCoverage(
-  settings: OrderApiSettings,
-  scope: OrderSyncScope,
-  rows: OrderListRow[],
-  total: number,
-  offset: number,
-  direction: 'asc' | 'desc',
-  hotWindowSize: number,
-  retryKeys: Set<string>,
-): Promise<OrderListRow[]> {
-  if (rows.length === 0) return [];
-  const isHot = (index: number): boolean => direction === 'desc'
-    ? offset + index < hotWindowSize
-    : offset + index >= Math.max(0, total - hotWindowSize);
-  // Existence coverage only proves that the backend has an order row. It does
-  // not prove that mutable status fields are current. Always re-upload a
-  // cancelled row discovered by the exact audit so the backend can remove it
-  // from future logistics candidates.
-  const needsStatusRefresh = (row: OrderListRow): boolean => isCancelledTikTokOrderRow(row.row);
-  const historicalRows = rows.filter((row, index) => (
-    !isHot(index) && !retryKeys.has(row.orderId) && !needsStatusRefresh(row)
-  ));
-  if (historicalRows.length === 0) return rows;
-  try {
-    const covered = new Map<string, boolean>();
-    for (let start = 0; start < historicalRows.length; start += ORDER_HAS_DATA_MAX_IDS) {
-      const chunk = historicalRows.slice(start, start + ORDER_HAS_DATA_MAX_IDS);
-      const result = await hasDataBulk(settings, scope, 'orders', chunk.map((row) => row.orderId));
-      Object.entries(result.covered).forEach(([orderId, value]) => covered.set(orderId, value));
-    }
-    return rows.filter((row, index) => (
-      isHot(index)
-      || retryKeys.has(row.orderId)
-      || needsStatusRefresh(row)
-      || covered.get(row.orderId) !== true
-    ));
-  } catch (error) {
-    await recordOrderSyncRuntimeLog('orders', 'coverage_audit', 'failed', '订单存在性巡检不可用，本页保守上传以避免漏单。', {
-      stage: 'order_checkpoint_audit',
-      offset,
-      rowCount: rows.length,
-      error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
-    });
-    return rows;
-  }
-}
-
-
 async function fetchOrderRowsForRound(
   state: OrderSyncState,
   settings: OrderApiSettings,
@@ -972,23 +921,11 @@ async function fetchOrderRowsForRound(
         const position = page.logicalOffset + index;
         if (positions.includes(position)) checkpointAnchors.set(position, row);
       });
-      const selected = await filterOrderRowsByCoverage(
-        settings,
-        scope,
-        page.rows,
-        total,
-        page.logicalOffset,
-        direction,
-        hotWindowSize,
-        retryKeys,
-      );
-      await emitPage(page, selected);
+      await emitPage(page, page.rows);
     };
     const result = await fetchOrderListRows(state, 'orders', onPage ? { onPage: captureAndFilter } : {});
     const total = result.totalRows ?? result.rows.length;
-    const selectedRows = onPage
-      ? []
-      : await filterOrderRowsByCoverage(settings, scope, result.rows, total, 0, direction, hotWindowSize, retryKeys);
+    const selectedRows = onPage ? [] : result.rows;
     const checkpoint = buildOrderListCheckpoint(
       total,
       direction,
@@ -1078,22 +1015,10 @@ async function fetchOrderRowsForRound(
       startOffset: auditStart,
       maxRows: ORDER_CHECKPOINT_AUDIT_WINDOW_SIZE,
       ...(onPage ? {
-        onPage: async (page: OrderListPage) => emitPage(
-          page,
-          await filterOrderRowsByCoverage(settings, scope, page.rows, tiktokTotal, page.logicalOffset, direction, hotWindowSize, retryKeys),
-        ),
+        onPage: async (page: OrderListPage) => emitPage(page, page.rows),
       } : {}),
     });
-    auditRows = onPage ? [] : await filterOrderRowsByCoverage(
-      settings,
-      scope,
-      auditPage.rows,
-      tiktokTotal,
-      auditStart,
-      direction,
-      hotWindowSize,
-      retryKeys,
-    );
+    auditRows = onPage ? [] : auditPage.rows;
     nextAuditOffset = hotWindowSize + ((auditStart - hotWindowSize + ORDER_CHECKPOINT_AUDIT_WINDOW_SIZE) % historicalTotal);
   }
   const checkpointAnchors = new Map<number, OrderListRow>();
@@ -3274,8 +3199,7 @@ export async function handleOrderSyncAlarm(trigger: OrderSyncTrigger = 'automati
 
 
 /**
- * Order page pipeline: selected rows are handed to order upload immediately;
- * exact repair pages may have existing historical rows filtered out by has-data.
+ * Order page pipeline: selected rows are handed to order upload immediately.
  * Logistics is a separate consumer driven by its own alarm/reconcile queue;
  * an N+1 logistics request must never hold the next order page hostage.
  */
@@ -3809,7 +3733,7 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
   });
   const orderBody = createOrderListRequestBody({ offset: 0, count: ORDER_LIST_PAGE_SIZE });
   const capturedAt = new Date().toISOString();
-  // 订单列表中的状态、金额和时间都是可变字段。has-data 只有存在性语义，不能
+  // 订单列表中的状态、金额和时间都是可变字段。后端自然键 upsert 负责幂等，
   // 再作为刷新闸门；后端自然键 upsert 负责幂等，列表结果全部进入本轮刷新。
   await processOrderDomainBatch(
     state,
@@ -4159,42 +4083,6 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
     );
     return;
   }
-  let coveredStatementIds = new Set<string>();
-  let coverageError: string | null = null;
-  let carriedCoveredCount: number | null = null;
-  if (domain === 'statements') {
-    const previous = state.orderProgress?.domains.statements;
-    const continuing = previous?.resumeOrderId !== null && previous?.resumeOrderId !== undefined
-      || (previous?.failedOrderIds?.length ?? 0) > 0
-      || previous?.currentOrderId !== null && previous?.currentOrderId !== undefined;
-    if (continuing) {
-      carriedCoveredCount = previous?.covered ?? 0;
-    } else {
-      try {
-        await recordOrderSyncRuntimeLog('statements', 'coverage_check', 'started', '结算已同步覆盖检查开始。', {
-          stage: 'order_sync_coverage',
-          statementCount: statementRows!.length,
-        });
-        coveredStatementIds = await fetchStatementCoverage(settings, scope, statementRows!);
-        await recordOrderSyncRuntimeLog('statements', 'coverage_check', 'succeeded', '结算已同步覆盖检查完成。', {
-          stage: 'order_sync_coverage',
-          statementCount: statementRows!.length,
-          coveredCount: coveredStatementIds.size,
-        });
-      } catch (error) {
-        // has-data is diagnostic/progress information only. Settlement heads and
-        // details are mutable, so an unavailable coverage endpoint must not turn
-        // this round into a no-op; the canonical upsert remains the retry-safe
-        // source of truth.
-        coverageError = error instanceof Error ? error.message : String(error);
-        await recordOrderSyncRuntimeLog('statements', 'coverage_check', 'failed', '结算已同步覆盖检查失败，将继续尝试写入结算数据。', {
-          stage: 'order_sync_coverage',
-          statementCount: statementRows!.length,
-          ...orderRequestExceptionDetails(error),
-        });
-      }
-    }
-  }
   // All order-domain rows are refreshed every round. Existence-only coverage
   // cannot detect mutable settlement corrections; the backend natural-key
   // upserts provide idempotency. The batch processor persists the cursor.
@@ -4346,9 +4234,9 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
         },
       };
     }),
-    carriedCoveredCount ?? coveredStatementIds.size,
     0,
-    coverageError,
+    0,
+    null,
   );
 }
 
@@ -4872,30 +4760,3 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 
 
-async function fetchStatementCoverage(
-  settings: OrderApiSettings,
-  scope: OrderSyncScope,
-  statementRows: readonly StatementPollingRow[],
-): Promise<Set<string>> {
-  const ids = [...new Set(statementRows.map((row) => row.statementId))];
-  const versions = Object.fromEntries(
-    [...new Map(statementRows.map((row) => [row.statementId, row.statementVersion])).entries()]
-      .map(([statementId]) => {
-        const values = statementRows
-          .filter((row) => row.statementId === statementId)
-          .map((row) => row.statementVersion);
-        return [statementId, values.length === 1 ? values[0]! : values] as const;
-      }),
-  );
-  const covered = new Set<string>();
-  for (let offset = 0; offset < ids.length; offset += ORDER_HAS_DATA_MAX_IDS) {
-    const chunk = ids.slice(offset, offset + ORDER_HAS_DATA_MAX_IDS);
-    const result = await hasDataBulk(settings, scope, 'statements', chunk, {
-      versions: Object.fromEntries(chunk.flatMap((id) => versions[id] === undefined ? [] : [[id, versions[id]]])),
-    });
-    for (const [statementId, isCovered] of Object.entries(result.covered)) {
-      if (isCovered) covered.add(statementId);
-    }
-  }
-  return covered;
-}

@@ -1,7 +1,7 @@
 /**
  * 订单 / 物流 / 结算 后台轮询的接线回归。
  *
- * 覆盖：alarm 注册与清除规则、三个暂停/关闭门控、has-data 只补缺的、
+ * 覆盖：alarm 注册与清除规则、三个暂停/关闭门控、
  * 订单域无 N+1、物流域逐单详情 + 请求间隔、单条失败不阻塞其余。
  *
  * 取数走 `executeTikTokRequestInBoundPage` 的页面执行器路径（bound tab +
@@ -17,7 +17,6 @@ const mocks = vi.hoisted(() => ({
   getState: vi.fn(),
   getStateWithinMutation: vi.fn(),
   saveState: vi.fn(),
-  hasDataBulk: vi.fn(),
   fetchReconciliation: vi.fn(),
   uploadDump: vi.fn(),
 }));
@@ -53,7 +52,6 @@ vi.mock('../src/core/order-sync', async () => {
     OrderSyncError: actual.OrderSyncError,
     createOrderSyncDump: actual.createOrderSyncDump,
     fetchOrderSyncReconciliation: mocks.fetchReconciliation,
-    hasDataBulk: mocks.hasDataBulk,
     uploadOrderSyncDump: mocks.uploadDump,
   };
 });
@@ -189,7 +187,6 @@ beforeEach(() => {
   mocks.getState.mockImplementation(async () => state);
   mocks.getStateWithinMutation.mockImplementation(async () => state);
   mocks.saveState.mockImplementation(async (next: OrderSyncState) => { state = next; });
-  mocks.hasDataBulk.mockResolvedValue({ covered: {} });
   mocks.fetchReconciliation.mockResolvedValue(null);
   mocks.uploadDump.mockResolvedValue({ requestId: 'req-1' });
 });
@@ -427,7 +424,6 @@ describe('订单域（无 N+1）', () => {
 
   it('advertiser 身份变化不应中断 seller 作用域的订单同步', async () => {
     stubFetch(['o1', 'o2']);
-    mocks.hasDataBulk.mockResolvedValue({ covered: {} });
     mocks.uploadDump.mockImplementation(async () => {
       state = {
         ...state,
@@ -446,7 +442,6 @@ describe('订单域（无 N+1）', () => {
 
   it('同步地址变化后不应继续向旧后端上传订单', async () => {
     stubFetch(['o1', 'o2']);
-    mocks.hasDataBulk.mockResolvedValue({ covered: {} });
     mocks.uploadDump.mockImplementationOnce(async () => {
       state = {
         ...state,
@@ -464,7 +459,6 @@ describe('订单域（无 N+1）', () => {
 
   it('已存在订单也必须刷新，不能用存在性当成可变数据的新鲜度证明', async () => {
     stubFetch(['o1', 'o2']);
-    mocks.hasDataBulk.mockResolvedValue({ covered: { o1: true, o2: true } });
 
     const running = handleOrderSyncAlarm();
     await vi.advanceTimersByTimeAsync(6_000);
@@ -472,45 +466,17 @@ describe('订单域（无 N+1）', () => {
 
     // 仅 1 次订单列表请求（订单字段都在列表行里）
     expect(requested.filter((url) => url.includes('/api/fulfillment/order/list'))).toHaveLength(1);
-    expect(mocks.hasDataBulk).not.toHaveBeenCalled();
     expect(uploadsForDomain('orders')).toHaveLength(2);
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId)).toEqual(['o1', 'o2']);
   });
 
-  it('has-data不可用也不应阻断订单刷新', async () => {
-    stubFetch(['o1']);
-    mocks.hasDataBulk.mockRejectedValue(new OrderSyncError('PROTOCOL', 'has-data 响应 envelope 无效'));
-
-    const running = handleOrderSyncAlarm();
-    await vi.advanceTimersByTimeAsync(6_000);
-    await running;
-
-    expect(mocks.hasDataBulk).not.toHaveBeenCalled();
-    expect(uploadsForDomain('orders')).toHaveLength(1);
-    expect(state.orderProgress?.status).toBe('ok');
-  });
-
-  it('订单列表超过 has-data 上限也按列表结果刷新，不因存在性接口制造漏单', async () => {
-    const ids = Array.from({ length: 501 }, (_, index) => `o${index + 1}`);
-    stubFetch(ids);
-
-    const running = handleOrderSyncAlarm();
-    await vi.advanceTimersByTimeAsync(2_000_000);
-    await running;
-
-    expect(mocks.hasDataBulk).toHaveBeenCalled();
-    expect(uploadsForDomain('orders')).toHaveLength(501);
-  });
-
   it('跨分页重复的订单只按一个同步单元处理', async () => {
     stubFetch(['o1', 'o1']);
-    mocks.hasDataBulk.mockResolvedValue({ covered: {} });
 
     const running = handleOrderSyncAlarm();
     await vi.advanceTimersByTimeAsync(6_000);
     await running;
 
-    expect(mocks.hasDataBulk).not.toHaveBeenCalled();
     expect(uploadsForDomain('orders')).toHaveLength(1);
   });
 
@@ -532,7 +498,6 @@ describe('订单域（无 N+1）', () => {
         },
       },
     };
-    mocks.hasDataBulk.mockResolvedValue({ covered: { o1: true, o2: true } });
     mocks.fetchReconciliation.mockResolvedValue({
       orders: {
         serverTotal: 2,
@@ -559,7 +524,8 @@ describe('订单域（无 N+1）', () => {
     await vi.advanceTimersByTimeAsync(12_000);
     await running;
 
-    expect(uploadsForDomain('orders')).toHaveLength(0);
+    // has-data 已移除，所有订单全量上传
+    expect(uploadsForDomain('orders')).toHaveLength(2);
     expect(state.orderProgress?.domains.orders).toMatchObject({
       total: 2,
       covered: 2,
@@ -589,9 +555,6 @@ describe('订单域（无 N+1）', () => {
         },
       },
     };
-    mocks.hasDataBulk.mockImplementation(async (...args: unknown[]) => ({
-      covered: Object.fromEntries((args[3] as string[]).map((id) => [id, true])),
-    }));
     mocks.fetchReconciliation.mockResolvedValue({
       orders: {
         serverTotal: 3,
@@ -619,9 +582,12 @@ describe('订单域（无 N+1）', () => {
     await vi.advanceTimersByTimeAsync(12_000);
     await running;
 
-    expect(uploadsForDomain('orders')).toHaveLength(2);
+    // has-data 已移除，所有订单全量上传
+    expect(uploadsForDomain('orders')).toHaveLength(7);
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
-      .toEqual(['new-1', 'new-2']);
+      .toContain('new-1');
+    expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
+      .toContain('new-2');
     expect(state.runtimeLogs.some((log) => log.context?.details?.action === 'incremental_selected'
       && log.context?.details?.strategy === 'incremental')).toBe(true);
   });
@@ -669,9 +635,6 @@ describe('订单域（无 N+1）', () => {
         hotWindowSize: 40,
       },
     });
-    mocks.hasDataBulk.mockImplementation(async (...args: unknown[]) => ({
-      covered: Object.fromEntries((args[3] as string[]).map((id) => [id, true])),
-    }));
     vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
       requested.push(String(input));
       const body = JSON.parse(String(init?.body ?? '{}')) as { offset?: number; count?: number };
@@ -691,10 +654,10 @@ describe('订单域（无 N+1）', () => {
     await vi.advanceTimersByTimeAsync(120_000);
     await running;
 
-    expect(mocks.hasDataBulk).toHaveBeenCalled();
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
       .toContain('new-1');
-    expect(uploadsForDomain('orders').length).toBeLessThanOrEqual(41);
+    // has-data 已移除，所有订单全量上传
+    expect(uploadsForDomain('orders').length).toBeLessThanOrEqual(80);
     expect(state.orderProgress?.domains.orders.syncStrategy).toBe('incremental');
     expect(state.orderProgress?.domains.orders.orderListCheckpoint).toMatchObject({
       total: 639,
@@ -735,9 +698,6 @@ describe('订单域（无 N+1）', () => {
         hotWindowSize: 1,
       },
     });
-    mocks.hasDataBulk.mockImplementation(async (...args: unknown[]) => ({
-      covered: Object.fromEntries((args[3] as string[]).map((id) => [id, id !== missingId])),
-    }));
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       code: 0,
       data: {
@@ -751,11 +711,10 @@ describe('订单域（无 N+1）', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await running;
 
-    expect(mocks.hasDataBulk).toHaveBeenCalled();
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
       .toContain(missingId);
-    expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
-      .not.toContain('o2');
+    // has-data 已移除，所有订单全量上传
+    expect(uploadsForDomain('orders')).toHaveLength(5);
   });
 
   it('升级后会精确巡检并刷新历史取消单，即使服务端已存在该订单', async () => {
@@ -786,9 +745,6 @@ describe('订单域（无 N+1）', () => {
         hotWindowSize: 1,
       },
     });
-    mocks.hasDataBulk.mockResolvedValue({
-      covered: { 'cancelled-historical': true, 'active-covered': true },
-    });
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       code: 0,
       data: {
@@ -804,8 +760,9 @@ describe('订单域（无 N+1）', () => {
 
     await handleOrderSyncAlarm();
 
+    // has-data 已移除，所有订单全量上传
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
-      .toEqual(['active-hot', 'cancelled-historical']);
+      .toEqual(['active-hot', 'cancelled-historical', 'active-covered']);
     expect(state.orderProgress?.domains.orders.syncStrategy).toBe('repair');
   });
 
@@ -837,9 +794,6 @@ describe('订单域（无 N+1）', () => {
         hotWindowSize: 1,
       },
     });
-    mocks.hasDataBulk.mockImplementation(async (...args: unknown[]) => ({
-      covered: Object.fromEntries((args[3] as string[]).map((id) => [id, id !== 'replacement-arbitrary-middle'])),
-    }));
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       code: 0,
       data: { main_orders: ids.map((id) => ({ main_order_id: id })), has_more: false, total_count: ids.length },
@@ -849,10 +803,10 @@ describe('订单域（无 N+1）', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await running;
 
+    // has-data 已移除，所有订单全量上传（含替换单）
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
       .toContain('replacement-arbitrary-middle');
-    expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
-      .not.toContain('o2');
+    expect(uploadsForDomain('orders')).toHaveLength(11);
   });
 
   it('存在性巡检失败时保守上传当前修复页，不把未知当成已覆盖', async () => {
@@ -882,14 +836,12 @@ describe('订单域（无 N+1）', () => {
         hotWindowSize: 1,
       },
     });
-    mocks.hasDataBulk.mockRejectedValue(new OrderSyncError('NETWORK', 'has-data timeout'));
     stubFetch(originalIds);
 
     const running = handleOrderSyncAlarm();
     await vi.advanceTimersByTimeAsync(60_000);
     await running;
 
-    expect(mocks.hasDataBulk).toHaveBeenCalled();
     expect(uploadsForDomain('orders')).toHaveLength(originalIds.length);
   });
 
@@ -910,7 +862,6 @@ describe('订单域（无 N+1）', () => {
     await running;
 
     expect(requested.filter((url) => url.includes('/api/fulfillment/order/list'))).toHaveLength(2);
-    expect(mocks.hasDataBulk).not.toHaveBeenCalled();
   });
 
   it('订单分页读取会实时记录当前页和估算总页数', async () => {
@@ -1223,9 +1174,6 @@ describe('订单域（无 N+1）', () => {
         },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }));
-    mocks.hasDataBulk.mockImplementation(async (...args: unknown[]) => ({
-      covered: Object.fromEntries((args[3] as string[]).map((id) => [id, id !== 'cursor-41'])),
-    }));
 
     const running = handleOrderSyncAlarm();
     await vi.advanceTimersByTimeAsync(200_000);
@@ -1233,7 +1181,6 @@ describe('订单域（无 N+1）', () => {
 
     expect(cursorRequests.slice(0, 3).map((request) => request.offset)).toEqual([0, 0, 0]);
     expect(cursorRequests.slice(0, 3).map((request) => request.paginationType)).toEqual([0, 1, 1]);
-    expect(mocks.hasDataBulk).toHaveBeenCalled();
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
       .toContain('cursor-41');
     expect(uploadsForDomain('orders').every((call) => {
@@ -1404,7 +1351,6 @@ describe('物流域（N+1，逐单详情）', () => {
     // 1 次列表 + 3 次详情
     expect(requested).toHaveLength(4);
     expect(requestedMethods).toEqual(['POST', 'GET', 'GET', 'GET']);
-    expect(mocks.hasDataBulk).not.toHaveBeenCalled();
     expect(mocks.uploadDump).toHaveBeenCalledTimes(3);
     expect(mocks.uploadDump.mock.calls.map((call) => (call[2] as { mainOrderId: string }).mainOrderId)).toEqual(['o1', 'o2', 'o3']);
   });
@@ -1810,16 +1756,10 @@ describe('结算域（全局列表）', () => {
 
     for (let round = 0; round < 11; round += 1) await pollOrderDomain('statements');
 
-    expect(mocks.hasDataBulk).toHaveBeenCalledTimes(2);
-    expect(mocks.hasDataBulk.mock.calls.map((call) => call[3])).toEqual([
-      expect.arrayContaining(['st-0', 'st-499']),
-      ['st-500'],
-    ]);
     expect(mocks.uploadDump).toHaveBeenCalledTimes(501);
   });
 
-  it('has-data 即使报告所有版本已存在，仍刷新结算可变字段', async () => {
-    mocks.hasDataBulk.mockResolvedValue({ covered: { 'st-1': true } });
+  it('结算全量刷新，不依赖 has-data 过滤', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       code: 0,
       message: '',
@@ -1834,7 +1774,6 @@ describe('结算域（全局列表）', () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await running;
 
-    expect(mocks.hasDataBulk).toHaveBeenCalledOnce();
     expect(mocks.uploadDump).toHaveBeenCalledOnce();
   });
 
@@ -1860,13 +1799,6 @@ describe('结算域（全局列表）', () => {
     }));
     await pollOrderDomain('statements');
 
-    expect(mocks.hasDataBulk).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.anything(),
-      'statements',
-      ['st-1', 'st-2'],
-      { versions: { 'st-1': [1, 2], 'st-2': 3 } },
-    );
     expect(mocks.uploadDump).toHaveBeenCalledTimes(3);
     expect(mocks.uploadDump.mock.calls.map((call) => call[2])).toEqual([
       expect.objectContaining({ domain: 'statements', statementId: 'st-1', statementVersion: 1 }),

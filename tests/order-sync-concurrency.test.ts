@@ -38,7 +38,6 @@ vi.mock('../src/core/order-sync', async () => {
   return {
     ...actual,
     fetchOrderSyncReconciliation: vi.fn(async () => null),
-    hasDataBulk: vi.fn(async () => ({ covered: {} })),
     uploadOrderSyncDump: vi.fn(async (settings: { syncToken: string }, _scope: unknown, dump: unknown) => {
       harness.uploads.push({ token: settings.syncToken, dump });
       return { requestId: 'test-upload' };
