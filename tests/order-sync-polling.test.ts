@@ -85,7 +85,13 @@ function boundState(overrides: Partial<OrderSyncState['settings']> = {}): OrderS
   return {
     ...defaults,
     shopRegion: { sellerId: 'seller', baseUrl: defaults.settings.syncBaseUrl, region: 'CN' },
-    boundTab: { tabId: 7, url: 'https://seller.tiktokglobalshop.com/ads', sellerId: 'seller', advertiserId: 'advertiser' },
+    boundTab: {
+      tabId: 7,
+      url: 'https://seller.tiktokglobalshop.com/ads',
+      sellerId: 'seller',
+      advertiserId: 'advertiser',
+      shopRegion: 'CN',
+    },
     settings: { ...defaults.settings, syncToken: 'fixture-token', ...overrides },
   };
 }
@@ -266,6 +272,24 @@ describe('订单域 alarm 注册规则', () => {
 });
 
 describe('订单域首次主动同步', () => {
+  it('缺少店铺地区时硬拦截，不发起任何 TikTok 请求', async () => {
+    state = {
+      ...state,
+      shopRegion: null,
+      boundTab: { ...state.boundTab!, shopRegion: undefined },
+    };
+
+    const usedPagePipeline = await handleOrderSyncAlarm('manual');
+
+    expect(usedPagePipeline).toBe(false);
+    expect(requested).toHaveLength(0);
+    expect(state.runtimeLogs.some((log) => log.context?.event === 'poll_skipped'
+      && log.context?.details?.hasShopRegion === false
+      && typeof log.message === 'string')).toBe(true);
+    expect(state.runtimeLogs.find((log) => log.context?.event === 'poll_skipped')?.message)
+      .toContain('店铺地区未配置');
+  });
+
   it('列表请求尚未返回时就持久化同步中和当前页', async () => {
     const progress = createDefaultOrderSyncState().orderProgress!;
     state = {

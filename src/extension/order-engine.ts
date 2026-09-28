@@ -490,11 +490,24 @@ export function resetTikTokEndpointCircuit(): void {
 
 // ─── 订单域后台轮询 ────────────────────────────────────────────
 
-/** 拉取前置条件：已绑定店铺 + 有令牌 + 未被暂停（手动或永久拒绝自动暂停）+ tts-erp 可达。 */
+/**
+ * Resolve the region captured from Seller Center or cached from the ERP
+ * lookup.  Region is required by the Seller Center request contract; an
+ * empty fallback silently produces requests for the wrong shop scope.
+ */
+export function orderShopRegion(state: OrderSyncState): string | null {
+  const sellerId = state.boundTab?.sellerId;
+  const cached = state.shopRegion?.sellerId === sellerId ? state.shopRegion.region.trim() : '';
+  const captured = state.boundTab?.shopRegion?.trim() ?? '';
+  return cached || captured || null;
+}
+
+/** 拉取前置条件：已绑定店铺 + Seller 地区 + 有令牌 + 未被暂停。 */
 async function orderPollingState(): Promise<OrderSyncState | null> {
   const state = await getOrderSyncState();
   const boundTab = state.boundTab;
   if (!boundTab?.tabId || !boundTab.sellerId) return null;
+  if (!orderShopRegion(state)) return null;
   if (!state.settings.syncToken.trim()) return null;
   if (state.settings.syncPaused === true) return null;
   // 0.1.149+：移除 autoPausedReason 全局熔断。needsHuman 是 per-unit，dumpWork 自然跳过。
@@ -510,6 +523,7 @@ function hasOrderDomainSyncConfiguration(state: OrderSyncState): boolean {
   return Boolean(
     state.boundTab?.tabId
     && state.boundTab.sellerId
+    && orderShopRegion(state)
     && state.settings.syncBaseUrl.trim()
     && state.settings.syncToken.trim()
     && state.settings.syncPaused !== true
@@ -538,6 +552,7 @@ async function isOrderSyncScopeCurrent(expected: OrderSyncState): Promise<boolea
     && current.boundTab?.sellerId === expected.boundTab?.sellerId
     && normaliseOrderSyncBaseUrl(current.settings.syncBaseUrl) === normaliseOrderSyncBaseUrl(expected.settings.syncBaseUrl)
     && current.settings.syncToken.trim() === expected.settings.syncToken.trim()
+    && orderShopRegion(current) === orderShopRegion(expected)
     && current.settings.syncPaused !== true
     && isOrderDomainSyncEnabled(current.settings);
 }
@@ -2864,7 +2879,7 @@ type StatementPollingRow = {
 async function fetchStatementRows(state: OrderSyncState): Promise<StatementPollingRow[]> {
   const boundTab = state.boundTab!;
   const origin = TIKTOK_STATEMENT_API_ORIGIN;
-  const identity = { sellerId: boundTab.sellerId!, region: state.shopRegion?.region ?? '' };
+  const identity = { sellerId: boundTab.sellerId!, region: orderShopRegion(state)! };
   const rows: StatementPollingRow[] = [];
   let from = 0;
   let hasMore = true;
@@ -3190,10 +3205,18 @@ function orderPollingGateDetails(state: OrderSyncState): Record<string, unknown>
   return {
     hasOrderBoundTab: Boolean(state.boundTab?.tabId),
     hasSellerId: Boolean(state.boundTab?.sellerId),
+    hasShopRegion: Boolean(orderShopRegion(state)),
+    shopRegion: orderShopRegion(state),
     hasSyncToken: state.settings.syncToken.trim().length > 0,
     syncPaused: state.settings.syncPaused === true,
     orderDomainSyncEnabled: isOrderDomainSyncEnabled(state.settings),
   };
+}
+
+function orderPollingGateMessage(state: OrderSyncState, domain: string): string {
+  return orderShopRegion(state)
+    ? `${domain} 主动轮询跳过：前置条件未满足。`
+    : `${domain} 主动轮询已拦截：店铺地区未配置，暂不请求 TikTok。`;
 }
 
 
@@ -3631,7 +3654,7 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
   const rawState = await getOrderSyncState();
   const state = await orderPollingState();
   if (!state) {
-    await recordOrderSyncRuntimeLog('orders', 'poll_skipped', 'skipped', '订单主动轮询跳过：前置条件未满足。', orderPollingGateDetails(rawState));
+    await recordOrderSyncRuntimeLog('orders', 'poll_skipped', 'skipped', orderPollingGateMessage(rawState, '订单'), orderPollingGateDetails(rawState));
     return false;
   }
   const settings = orderSyncSettingsFor(state);
@@ -3917,6 +3940,9 @@ export async function requestManualOrderDomainSync(retryFailedOnly: boolean): Pr
   if (!current.boundTab?.sellerId || !current.settings.syncToken.trim() || !isOrderDomainSyncEnabled(current.settings)) {
     throw new Error('请先绑定店铺并完成订单同步配置。');
   }
+  if (!orderShopRegion(current)) {
+    throw new Error('店铺地区未配置，无法开始订单同步。请先在 Seller Center 或 TTS-ERP 店铺账号中填写地区代码。');
+  }
   const running = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const).filter((domain) =>
     current.orderProgress?.domains[domain]?.syncRunStatus === 'running',
   );
@@ -4004,7 +4030,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
   const rawState = await getOrderSyncState();
   const state = await orderPollingState();
   if (!state) {
-    await recordOrderSyncRuntimeLog(domain, 'poll_skipped', 'skipped', `${domain} 主动轮询跳过：前置条件未满足。`, orderPollingGateDetails(rawState));
+    await recordOrderSyncRuntimeLog(domain, 'poll_skipped', 'skipped', orderPollingGateMessage(rawState, domain), orderPollingGateDetails(rawState));
     return;
   }
   const settings = orderSyncSettingsFor(state);
@@ -4206,7 +4232,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
           const detailUrl = tiktokStatementEndpointUrl(
             origin,
             'statement-transaction-detail',
-            { sellerId: boundTab.sellerId!, region: state.shopRegion?.region ?? '' },
+            { sellerId: boundTab.sellerId!, region: orderShopRegion(state)! },
             createStatementTransactionDetailQuery({
               statementSkuDetailId: statement.statementSkuDetailId,
               statementVersion: statement.statementVersion,
@@ -4451,7 +4477,10 @@ async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger
   const state = await orderPollingState();
   if (!state) {
     if (rawState.boundTab && rawState.settings.syncToken.trim() && isOrderDomainSyncEnabled(rawState.settings)) {
-      await recordOrderSyncRuntimeLog('all', 'initial_sync_waiting', 'skipped', '首次订单同步等待 Seller ID 捕获，暂未发起订单接口请求。', {
+      const message = rawState.boundTab.sellerId && !orderShopRegion(rawState)
+        ? '首次订单同步已拦截：店铺地区未配置，暂未发起订单接口请求。'
+        : '首次订单同步等待 Seller ID 捕获，暂未发起订单接口请求。';
+      await recordOrderSyncRuntimeLog('all', 'initial_sync_waiting', 'skipped', message, {
         stage: 'initial_sync',
         ...orderPollingGateDetails(rawState),
       });

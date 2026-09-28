@@ -59,6 +59,7 @@ function stateFor(sellerId: string): OrderSyncState {
   return {
     ...base,
     settings: { ...base.settings, syncToken: `token-${sellerId}` },
+    shopRegion: { sellerId, baseUrl: base.settings.syncBaseUrl, region: 'CN' },
     boundTab: {
       tabId: 7,
       url: 'https://seller.tiktokglobalshop.com/orders',
