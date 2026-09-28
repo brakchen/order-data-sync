@@ -175,14 +175,12 @@ async function clearOrderBinding(
       boundTab: boundTabWithoutSellerId,
       shopRegion: null,
     });
-    for (const name of [ORDER_SYNC_ALARM, ORDER_CONTINUATION_ALARM, LOGISTICS_SYNC_ALARM,
-      LOGISTICS_CONTINUATION_ALARM, SETTLEMENT_SYNC_ALARM, SETTLEMENT_CONTINUATION_ALARM,
-      ORDER_DETAILS_SYNC_ALARM, ORDER_DETAILS_CONTINUATION_ALARM,
-      ORDER_HISTORY_SYNC_ALARM, ORDER_HISTORY_CONTINUATION_ALARM]) {
+    for (const name of Object.values(ORDER_SYNC_ALARMS)) {
       await chrome.alarms.clear(name);
     }
-    await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
-    await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
+    for (const name of Object.values(SELLER_TAB_ALARMS)) {
+      await chrome.alarms.clear(name);
+    }
     await chrome.alarms.create(SELLER_TAB_ALARMS.watch, {
       delayInMinutes: SELLER_TAB_WATCH_DELAY_MINUTES,
     });

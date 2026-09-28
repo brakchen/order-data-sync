@@ -166,7 +166,7 @@ function updateHealth(healthy: boolean, error?: string): void {
   } else {
     const consecutiveFailures = healthState.consecutiveFailures + 1;
     healthState = {
-      healthy: consecutiveFailures >= HEALTH_FAILURE_THRESHOLD,
+      healthy: consecutiveFailures < HEALTH_FAILURE_THRESHOLD,
       lastCheckedAt: Date.now(),
       lastError: error,
       consecutiveFailures,
