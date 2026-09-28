@@ -27,6 +27,14 @@ import { StatementListResponseSchema } from '../core/tiktok-statement-endpoint-s
 import { createAdaptivePageLoadGuard } from '../core/adaptive-page-load-guard';
 import { createRequestRateLimiter } from '../core/request-rate-limiter';
 import { normalizeOrderSyncBaseUrl } from '../core/settings';
+import {
+  checkTtsErpHealth,
+  getTtsErpHealthState,
+  isTtsErpHealthy,
+  resetHealthState,
+  startHealthPolling,
+  stopHealthPolling,
+} from '../core/tts-erp-health';
 import type {
   OrderBoundTab,
   OrderDomainKey,
@@ -182,6 +190,8 @@ async function clearOrderBinding(
     return true;
   });
   if (!cleared) return;
+  // 停止探活轮询
+  stopTtsErpHealthPolling();
   await recordOrderSyncRuntimeLog('all', 'seller_binding_auth_expired', 'skipped', 'Seller Center 会话已失效，已停止同步并保留断点，等待重新登录或同域名页面接管。', {
     stage: 'seller_binding',
     reason,
@@ -480,7 +490,7 @@ export function resetTikTokEndpointCircuit(): void {
 
 // ─── 订单域后台轮询 ────────────────────────────────────────────
 
-/** 拉取前置条件：已绑定店铺 + 有令牌 + 未被暂停（手动或永久拒绝自动暂停）。 */
+/** 拉取前置条件：已绑定店铺 + 有令牌 + 未被暂停（手动或永久拒绝自动暂停）+ tts-erp 可达。 */
 async function orderPollingState(): Promise<OrderSyncState | null> {
   const state = await getOrderSyncState();
   const boundTab = state.boundTab;
@@ -489,6 +499,8 @@ async function orderPollingState(): Promise<OrderSyncState | null> {
   if (state.settings.syncPaused === true) return null;
   // 0.1.149+：移除 autoPausedReason 全局熔断。needsHuman 是 per-unit，dumpWork 自然跳过。
   if (!isOrderDomainSyncEnabled(state.settings)) return null;
+  // tts-erp 探活门控：/healthz 不可达时暂停所有同步，等待恢复。
+  if (!isTtsErpHealthy()) return null;
   return state;
 }
 
@@ -4334,7 +4346,49 @@ export async function ensureBoundDomainAlarms(
   await ensureSettlementSyncAlarm();
   await ensureOrderDetailsSyncAlarm();
   await ensureOrderHistorySyncAlarm();
+  // 启动 3 秒探活轮询（setInterval，非 chrome.alarms）
+  startHealthPolling(
+    async () => {
+      const state = await getOrderSyncState();
+      return state.settings.syncBaseUrl?.trim() || undefined;
+    },
+    (healthy, healthState) => {
+      void handleTtsErpHealthStateChange(healthy, healthState).catch(reportSchedulerError);
+    },
+  );
   void maybeStartInitialOrderDomainSync(initialSyncTrigger).catch(() => undefined);
+}
+
+// ─── tts-erp /healthz 探活 ─────────────────────────────────────────
+
+/**
+ * 探活状态变化回调。由 startHealthPolling 的 onStateChange 触发。
+ * 记 runtime log，恢复时触发一轮同步。
+ */
+async function handleTtsErpHealthStateChange(
+  healthy: boolean,
+  healthState: TtsErpHealthState,
+): Promise<void> {
+  if (!healthy) {
+    await recordOrderSyncRuntimeLog('all', 'tts_erp_unreachable', 'failed',
+      'tts-erp 服务不可达，订单同步已暂停。等待恢复后自动继续。', {
+        ttsErpHealthy: false,
+        ttsErpLastError: healthState.lastError,
+        ttsErpConsecutiveFailures: healthState.consecutiveFailures,
+      });
+  } else {
+    await recordOrderSyncRuntimeLog('all', 'tts_erp_recovered', 'succeeded',
+      'tts-erp 服务已恢复，订单同步将自动继续。', {
+        ttsErpHealthy: true,
+      });
+    // 恢复后立即触发一轮同步
+    void maybeStartInitialOrderDomainSync('configuration_ready').catch(() => undefined);
+  }
+}
+
+/** 停止探活轮询。解绑时调用。 */
+export function stopTtsErpHealthPolling(): void {
+  stopHealthPolling();
 }
 
 

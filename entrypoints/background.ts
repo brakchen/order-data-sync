@@ -25,7 +25,9 @@ import {
   SELLER_TAB_ALARMS,
   SELLER_TAB_WATCH_DELAY_MINUTES,
   stopStuckOrderDomainAndRetry,
+  stopTtsErpHealthPolling,
 } from '../src/extension/order-engine';
+import { getTtsErpHealthState, resetHealthState } from '../src/core/tts-erp-health';
 
 const SELLER_TAB_REFRESH_DELAY_MINUTES = 120;
 const SELLER_TAB_REFRESH_RETRY_MINUTES = 5;
@@ -145,8 +147,10 @@ export async function handleOrderMessage(
   sender: chrome.runtime.MessageSender,
 ): Promise<unknown> {
   switch (message.type) {
-    case 'order-sync:get-state':
-      return getOrderSyncState();
+    case 'order-sync:get-state': {
+      const state = await getOrderSyncState();
+      return { ...state, ttsErpHealth: getTtsErpHealthState() };
+    }
     case 'order-sync:save-settings': {
       const settings = normalizeOrderSyncSettings(message.settings);
       if (settings.syncBaseUrl && !isHttpUrl(settings.syncBaseUrl)) throw new Error('同步地址必须是有效的 HTTP(S) URL。');
@@ -177,6 +181,8 @@ export async function handleOrderMessage(
         };
       });
       if (circuitResetRequested) resetTikTokEndpointCircuit();
+      // 目标地址变更时重置探活状态，立即重新检查新地址
+      resetHealthState();
       await ensureBoundAlarms('configuration_ready');
       if (shouldStartAutoBinding) void startAutomaticSellerBinding().catch((error) => reportError(error, 'auto_bind'));
       return next;

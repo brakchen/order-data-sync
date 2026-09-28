@@ -46,3 +46,12 @@ dt { color: #79857f; } dd { max-width: 225px; margin: 0; overflow: hidden; text-
 .stop-button:hover:not(:disabled) { background: #ffe4e0; }
 .notice { margin: 0; color: #176b59; font-size: 11px; }
 footer { padding: 0 3px 4px; }
+
+/* tts-erp 健康状态指示 */
+.health-indicator { display: flex; align-items: center; gap: 6px; margin-left: auto; padding: 4px 10px; border-radius: 99px; font-size: 10px; font-weight: 600; }
+.health-up { color: #176b59; background: #e4f3ed; }
+.health-down { color: #a64036; background: #fff1ef; }
+.health-dot { width: 8px; height: 8px; border-radius: 50%; }
+.health-up .health-dot { background: #176b59; }
+.health-down .health-dot { background: #a64036; animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }

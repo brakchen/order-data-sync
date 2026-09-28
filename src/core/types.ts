@@ -129,4 +129,10 @@ export interface OrderSyncState {
   runtimeLogs: OrderRuntimeLog[];
   createdAt: string;
   updatedAt: string;
+  ttsErpHealth?: {
+    healthy: boolean;
+    lastCheckedAt: number;
+    lastError?: string;
+    consecutiveFailures: number;
+  };
 }
