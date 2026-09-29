@@ -28,22 +28,26 @@ vi.mock('../src/extension/storage', async () => {
   const actual = await vi.importActual<typeof import('../src/extension/storage')>(
     '../src/extension/storage',
   );
+  let updateTail: Promise<unknown> = Promise.resolve();
+  const update = (mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>) => {
+    const task = updateTail.then(async () => {
+      const next = await mutation(await mocks.getState());
+      await mocks.saveState(next);
+      return next;
+    }, async () => {
+      const next = await mutation(await mocks.getState());
+      await mocks.saveState(next);
+      return next;
+    });
+    updateTail = task.then(() => undefined, () => undefined);
+    return task;
+  };
   return {
     createDefaultOrderSyncState: actual.createDefaultOrderSyncState,
     createDefaultOrderProgress: actual.createDefaultOrderProgress,
-    mutateOrderSyncState: (mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>) =>
-      actual.runOrderSyncStateMutation(async () => {
-        const current = await mocks.getState();
-        const next = await mutation(current);
-        await mocks.saveState(next);
-        return next;
-      }),
+    orderSyncStateStore: { read: mocks.getState, update },
     createSafeErrorSummary: vi.fn(() => '同步失败,请检查同步配置与网络。'),
-    getOrderSyncState: mocks.getState,
-    getOrderSyncStateWithinMutation: mocks.getStateWithinMutation,
     ORDER_RUNTIME_LOG_LIMIT: 5_000,
-    runOrderSyncStateMutation: actual.runOrderSyncStateMutation,
-    saveOrderSyncState: mocks.saveState,
     sanitizeDiagnosticText: (value: string) => value,
   };
 });

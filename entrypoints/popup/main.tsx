@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createDefaultOrderSettings } from '../../src/core/settings';
 import type { OrderExtensionMessage } from '../../src/extension/messages';
-import type { OrderDisplayDomainKey, OrderSyncSettings, OrderSyncState } from '../../src/core/types';
+import { createPopupApplicationState } from '../../src/extension/popup-application-state';
+import type { OrderDisplayDomainKey, OrderSyncState } from '../../src/core/types';
 import './style.css';
 
 type Reply<T> = { ok: true; data: T } | { ok: false; error: string };
@@ -24,104 +24,40 @@ const DISPLAY_DOMAINS: readonly OrderDisplayDomainKey[] = [
 ];
 
 function Popup() {
-  const [state, setState] = useState<OrderSyncState | null>(null);
-  const [draft, setDraft] = useState<OrderSyncSettings>(createDefaultOrderSettings());
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState('');
-  const settingsInitialized = useRef(false);
-  const lastSavedSettings = useRef('');
-  const draftTouched = useRef(false);
-
-  const refresh = async (updateDraft = false) => {
-    try {
-      const result = await send<OrderSyncState>({ type: 'order-sync:get-state' });
-      setState(result);
-      if (updateDraft) {
-        settingsInitialized.current = true;
-        lastSavedSettings.current = serializeSettings(result.settings);
-        if (!draftTouched.current) setDraft(result.settings);
-      }
-    } catch (error) {
-      setNotice(toMessage(error));
-    }
-  };
+  const application = useMemo(() => createPopupApplicationState({
+    loadState: () => send<OrderSyncState>({ type: 'order-sync:get-state' }),
+    saveSettings: (settings) => send<OrderSyncState>({ type: 'order-sync:save-settings', settings }),
+    syncDomains: (retryFailedOnly) => send<OrderSyncState>({ type: 'order-sync:sync-domains', retryFailedOnly }),
+    stopStuckDomain: (domain) => send<OrderSyncState>({ type: 'order-sync:stop-stuck-domain', domain }),
+    schedule: (task, delayMs) => window.setTimeout(task, delayMs),
+    cancel: (handle) => window.clearTimeout(handle),
+  }), []);
+  const { state, draft, busy, notice } = useSyncExternalStore(
+    application.subscribe,
+    application.getSnapshot,
+  );
 
   useEffect(() => {
-    void refresh(true);
+    void application.initialize();
     const changed = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
-      if (area === 'local' && changes.orderSyncState) void refresh();
+      if (area === 'local' && changes.orderSyncState) void application.refresh();
     };
     chrome.storage.onChanged.addListener(changed);
     return () => chrome.storage.onChanged.removeListener(changed);
-  }, []);
+  }, [application]);
 
-  const run = async (
-    action: () => Promise<OrderSyncState>,
-    success: string,
-    updateDraft = false,
-  ) => {
-    setBusy(true);
-    setNotice('');
-    try {
-      const next = await action();
-      setState(next);
-      if (updateDraft) {
-        settingsInitialized.current = true;
-        lastSavedSettings.current = serializeSettings(next.settings);
-        draftTouched.current = false;
-        setDraft(next.settings);
-      }
-      setNotice(success);
-    } catch (error) {
-      setNotice(toMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const saveDraftSettings = (settings: OrderSyncSettings, success: string) => run(
-    () => send<OrderSyncState>({ type: 'order-sync:save-settings', settings }),
-    success,
-    true,
-  );
-  useEffect(() => {
-    if (!settingsInitialized.current) return undefined;
-    const serialized = serializeSettings(draft);
-    if (serialized === lastSavedSettings.current) return undefined;
-    const timer = window.setTimeout(() => {
-      void saveDraftSettings(draft, '配置已自动保存。');
-    }, 600);
-    return () => window.clearTimeout(timer);
-  }, [draft, state]);
-  const updateDraft = (next: OrderSyncSettings) => {
-    draftTouched.current = true;
-    setDraft(next);
-  };
-  const sync = (retryFailedOnly: boolean) => run(
-    () => send<OrderSyncState>({ type: 'order-sync:sync-domains', retryFailedOnly }),
-    retryFailedOnly ? '失败项已加入同步队列。' : '订单域各接口同步已启动。',
-  );
   const exportLogs = () => {
-    if (!state) return;
-    const exportedAt = new Date();
-    const payload = {
-      schemaVersion: 1,
-      exportedAt: exportedAt.toISOString(),
-      extensionVersion: chrome.runtime.getManifest().version,
-      boundTab: state.boundTab,
-      orderProgress: state.orderProgress,
-      runtimeLogs: state.runtimeLogs,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const exported = application.exportLogs(chrome.runtime.getManifest().version);
+    if (!exported) return;
+    const blob = new Blob([exported.contents], { type: 'application/json;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `order-data-sync-logs-${formatFileTimestamp(exportedAt)}.json`;
+    anchor.download = exported.fileName;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    setNotice(`已导出 ${state.runtimeLogs.length} 条运行日志。`);
   };
   const readyToSync = Boolean(state?.boundTab?.sellerId && state.settings.syncToken.trim()
     && state.settings.orderDomainSyncEnabled && !state.settings.syncPaused);
@@ -148,16 +84,16 @@ function Popup() {
         <div className="section-title"><h2>下游配置</h2><span className="caption">自动保存</span></div>
         <label>同步地址
           <input type="url" value={draft.syncBaseUrl} placeholder="https://example.com/tts"
-            onChange={(event) => updateDraft({ ...draft, syncBaseUrl: event.target.value })} />
+            onChange={(event) => application.updateDraft({ ...draft, syncBaseUrl: event.target.value })} />
         </label>
         <label>访问令牌
           <input type="password" value={draft.syncToken} autoComplete="off" placeholder="Bearer token"
-            onChange={(event) => updateDraft({ ...draft, syncToken: event.target.value })}
-            onBlur={() => void saveDraftSettings(draft, '访问令牌已自动保存。')} />
+            onChange={(event) => application.updateDraft({ ...draft, syncToken: event.target.value })}
+            onBlur={() => void application.saveSettingsNow('访问令牌已自动保存。')} />
         </label>
         <label className="check-row">
           <input type="checkbox" checked={!draft.orderDomainSyncEnabled}
-            onChange={(event) => updateDraft({ ...draft, orderDomainSyncEnabled: !event.target.checked })} />
+            onChange={(event) => application.updateDraft({ ...draft, orderDomainSyncEnabled: !event.target.checked })} />
           <span>暂停自动采集</span>
         </label>
       </section>
@@ -182,11 +118,11 @@ function Popup() {
         </div> : null}
         <div className="next-sync"><span>下次同步</span><strong>{formatNextSync(state)}</strong></div>
         <div className="sync-actions">
-          <button disabled={busy || !readyToSync} onClick={() => void sync(false)}>立即同步</button>
+          <button disabled={busy || !readyToSync} onClick={() => void application.syncDomains(false)}>立即同步</button>
           <button className="secondary" disabled={busy || !state}
             onClick={exportLogs}>导出日志（{state?.runtimeLogs.length ?? 0}）</button>
           {hasFailures ? <button className="secondary" disabled={busy || !readyToSync}
-            onClick={() => void sync(true)}>重试失败项</button> : null}
+            onClick={() => void application.syncDomains(true)}>重试失败项</button> : null}
         </div>
         <div className="domain-list">
           {DISPLAY_DOMAINS.map((domain) => {
@@ -199,10 +135,10 @@ function Popup() {
               {row?.lastError ? <small className="error">{row.lastError}</small> : null}
               {domain !== 'after_sales' && row?.syncRunStatus === 'running'
                 && Date.now() - Date.parse(row.lastProgressAt ?? '') > 2 * 60_000
-                ? <button className="stop-button" disabled={busy} onClick={() => void run(
-                  () => send<OrderSyncState>({ type: 'order-sync:stop-stuck-domain', domain }),
-                  `${DOMAIN_LABELS[domain]}任务已停止并从断点重试。`,
-                )}>停止卡住任务并重试</button> : null}
+                ? <button className="stop-button" disabled={busy}
+                  onClick={() => void application.stopStuckDomain(domain, DOMAIN_LABELS[domain])}>
+                  停止卡住任务并重试
+                </button> : null}
             </div>;
           })}
         </div>
@@ -248,23 +184,6 @@ function formatNextSync(state: OrderSyncState | null): string {
 function orderTotal(row: OrderSyncState['orderProgress']['domains']['orders'] | undefined): number {
   if (!row) return 0;
   return Math.max(0, row.serverTotal ?? row.total ?? 0);
-}
-
-function formatFileTimestamp(value: Date): string {
-  return value.toISOString().replace(/[:.]/g, '-');
-}
-
-function serializeSettings(value: OrderSyncSettings): string {
-  return JSON.stringify({
-    syncBaseUrl: value.syncBaseUrl,
-    syncToken: value.syncToken,
-    syncPaused: value.syncPaused,
-    orderDomainSyncEnabled: value.orderDomainSyncEnabled,
-  });
-}
-
-function toMessage(error: unknown): string {
-  return error instanceof Error ? error.message : '操作失败。';
 }
 
 createRoot(document.getElementById('root')!).render(<Popup />);

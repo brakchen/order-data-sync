@@ -66,43 +66,50 @@ export function createDefaultOrderSyncState(now = new Date().toISOString()): Ord
   };
 }
 
-export async function getOrderSyncState(): Promise<OrderSyncState> {
-  const stored = await chrome.storage.local.get(ORDER_SYNC_STATE_KEY);
-  return normalizeOrderSyncState(stored[ORDER_SYNC_STATE_KEY]);
+export interface OrderSyncStateStorageAdapter {
+  load(): Promise<unknown>;
+  save(state: OrderSyncState): Promise<void>;
 }
 
-/** State reads and writes share one queue, preventing alarm completions from losing checkpoints. */
-let mutationTail: Promise<unknown> = Promise.resolve();
-
-export function runOrderSyncStateMutation<T>(mutation: () => Promise<T>): Promise<T> {
-  const task = mutationTail.then(mutation, mutation);
-  mutationTail = task.then(() => undefined, () => undefined);
-  return task;
+export interface OrderSyncStateStore {
+  read(): Promise<OrderSyncState>;
+  update(
+    mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>,
+  ): Promise<OrderSyncState>;
 }
 
-export async function getOrderSyncStateWithinMutation(): Promise<OrderSyncState> {
-  const stored = await chrome.storage.local.get(ORDER_SYNC_STATE_KEY);
-  return normalizeOrderSyncState(stored[ORDER_SYNC_STATE_KEY]);
+export function createOrderSyncStateStore(adapter: OrderSyncStateStorageAdapter): OrderSyncStateStore {
+  let updateTail: Promise<unknown> = Promise.resolve();
+  const read = async (): Promise<OrderSyncState> => normalizeOrderSyncState(await adapter.load());
+  return {
+    read,
+    update(mutation) {
+      const task = updateTail.then(async () => {
+        const next = normalizeOrderSyncState(await mutation(await read()));
+        next.updatedAt = new Date().toISOString();
+        await adapter.save(next);
+        return next;
+      }, async () => {
+        const next = normalizeOrderSyncState(await mutation(await read()));
+        next.updatedAt = new Date().toISOString();
+        await adapter.save(next);
+        return next;
+      });
+      updateTail = task.then(() => undefined, () => undefined);
+      return task;
+    },
+  };
 }
 
-export function mutateOrderSyncState(
-  mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>,
-): Promise<OrderSyncState> {
-  return runOrderSyncStateMutation(async () => {
-    const current = await getOrderSyncState();
-    const next = await mutation(current);
-    const normalized = normalizeOrderSyncState(next);
-    normalized.updatedAt = new Date().toISOString();
-    await chrome.storage.local.set({ [ORDER_SYNC_STATE_KEY]: normalized });
-    return normalized;
-  });
-}
-
-export async function saveOrderSyncState(state: OrderSyncState): Promise<void> {
-  const normalized = normalizeOrderSyncState(state);
-  normalized.updatedAt = new Date().toISOString();
-  await chrome.storage.local.set({ [ORDER_SYNC_STATE_KEY]: normalized });
-}
+export const orderSyncStateStore = createOrderSyncStateStore({
+  async load() {
+    const stored = await chrome.storage.local.get(ORDER_SYNC_STATE_KEY);
+    return stored[ORDER_SYNC_STATE_KEY];
+  },
+  async save(state) {
+    await chrome.storage.local.set({ [ORDER_SYNC_STATE_KEY]: state });
+  },
+});
 
 export function normalizeOrderSyncState(value: unknown): OrderSyncState {
   const base = createDefaultOrderSyncState();

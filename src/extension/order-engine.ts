@@ -10,10 +10,6 @@ import {
 } from '../core/order-sync';
 import { createLogisticDetailQuery, createOrderGetRequestBody, createOrderHistoryRequestBody, createOrderListRequestBody, tiktokOrderEndpointUrl, tiktokOrderHistoryEndpointUrl } from '../core/tiktok-order-endpoints';
 import { parseSellerIdentityResponse, tiktokSellerIdentityEndpointUrl, type SellerIdentityResponseData } from '../core/tiktok-seller-endpoints';
-import {
-  SELLER_PAGE_COORDINATION_KEY,
-  SELLER_PAGE_REQUEST_LEASE_MS,
-} from './seller-page-coordination';
 import { OrderGetResponseSchema, OrderHistoryResponseSchema } from '../core/tiktok-order-endpoint-schemas';
 import { isCancelledTikTokOrderRow } from '../core/tiktok-order-status';
 import {
@@ -53,15 +49,10 @@ import type {
   OrderSyncState,
   OrderSyncTrigger,
 } from '../core/types';
-import { fetchTikTokResponse, type BoundTikTokResponse } from './tiktok-page-response';
-import type { PageProxyRequestPayload } from './page-request-protocol';
-import {
-  createDefaultOrderProgress,
-  getOrderSyncState,
-  getOrderSyncStateWithinMutation,
-  runOrderSyncStateMutation,
-  saveOrderSyncState,
-} from './storage';
+import type { BoundTikTokResponse } from './tiktok-page-response';
+import { createChromeBoundPageTransport } from './bound-page-transport';
+import { createDefaultOrderProgress, orderSyncStateStore } from './storage';
+import { OrderRunCoordinator, type OrderRunLockSnapshot } from './order-run-coordinator';
 
 type OrderPollingDomain = OrderDomainKey;
 const ORDER_PAGE_REQUEST_TIMEOUT_MS = 30_000;
@@ -169,32 +160,32 @@ async function clearOrderBinding(
   expectedState: OrderSyncState,
   reason = 'unknown',
 ): Promise<void> {
-  const cleared = await runOrderSyncStateMutation(async () => {
-    const current = await getOrderSyncStateWithinMutation();
+  let cleared = false;
+  await orderSyncStateStore.update((current) => {
     if (current.boundTab?.tabId !== expectedState.boundTab?.tabId
       || current.boundTab?.sellerId !== expectedState.boundTab?.sellerId
       || normaliseOrderSyncBaseUrl(current.settings.syncBaseUrl)
         !== normaliseOrderSyncBaseUrl(expectedState.settings.syncBaseUrl)
-      || current.settings.syncToken.trim() !== expectedState.settings.syncToken.trim()) return false;
-    if (!current.boundTab) return false;
+      || current.settings.syncToken.trim() !== expectedState.settings.syncToken.trim()
+      || !current.boundTab) return current;
     const { sellerId: _sellerId, ...boundTabWithoutSellerId } = current.boundTab;
-    await saveOrderSyncState({
+    cleared = true;
+    return {
       ...current,
       boundTab: boundTabWithoutSellerId,
       shopRegion: null,
-    });
-    for (const name of Object.values(ORDER_SYNC_ALARMS)) {
-      await chrome.alarms.clear(name);
-    }
-    for (const name of Object.values(SELLER_TAB_ALARMS)) {
-      await chrome.alarms.clear(name);
-    }
-    await chrome.alarms.create(SELLER_TAB_ALARMS.watch, {
-      delayInMinutes: SELLER_TAB_WATCH_DELAY_MINUTES,
-    });
-    return true;
+    };
   });
   if (!cleared) return;
+  for (const name of Object.values(ORDER_SYNC_ALARMS)) {
+    await chrome.alarms.clear(name);
+  }
+  for (const name of Object.values(SELLER_TAB_ALARMS)) {
+    await chrome.alarms.clear(name);
+  }
+  await chrome.alarms.create(SELLER_TAB_ALARMS.watch, {
+    delayInMinutes: SELLER_TAB_WATCH_DELAY_MINUTES,
+  });
   // 停止探活轮询
   stopTtsErpHealthPolling();
   await recordOrderSyncRuntimeLog('all', 'seller_binding_auth_expired', 'skipped', 'Seller Center 会话已失效，已停止同步并保留断点，等待重新登录或同域名页面接管。', {
@@ -457,8 +448,7 @@ async function noteTikTokEndpointResponse(url: string, response: BoundTikTokResp
   tiktokEndpointFailures.set(endpoint, next);
   if (!next.tripped || previous.tripped) return;
   tiktokEndpointCircuitOpen = true;
-  await runOrderSyncStateMutation(async () => {
-    const current = await getOrderSyncStateWithinMutation();
+  await orderSyncStateStore.update((current) => {
     const now = new Date().toISOString();
     const log: OrderRuntimeLog = {
       id: `order-sync-all-endpoint_circuit_open-${crypto.randomUUID()}`,
@@ -474,7 +464,7 @@ async function noteTikTokEndpointResponse(url: string, response: BoundTikTokResp
         manualInterventionRequired: true,
       }),
     };
-    await saveOrderSyncState({
+    return {
       ...current,
       settings: { ...current.settings, syncPaused: true },
       endpointCircuit: {
@@ -485,7 +475,7 @@ async function noteTikTokEndpointResponse(url: string, response: BoundTikTokResp
         openedAt: now,
       },
       runtimeLogs: [...current.runtimeLogs, log].slice(-MAX_RUNTIME_LOGS),
-    });
+    };
   });
 }
 
@@ -512,7 +502,7 @@ export function orderShopRegion(state: OrderSyncState): string | null {
 
 /** 拉取前置条件：已绑定店铺 + Seller 地区 + 有令牌 + 未被暂停。 */
 async function orderPollingState(): Promise<OrderSyncState | null> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   const boundTab = state.boundTab;
   if (!boundTab?.tabId || !boundTab.sellerId) return null;
   if (!orderShopRegion(state)) return null;
@@ -555,7 +545,7 @@ function orderSyncScopeFor(state: OrderSyncState): OrderSyncScope {
 
 /** Prevent a long order/logistics pass from writing after a shop or token changed. */
 async function isOrderSyncScopeCurrent(expected: OrderSyncState): Promise<boolean> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   return current.boundTab?.tabId === expected.boundTab?.tabId
     && current.boundTab?.sellerId === expected.boundTab?.sellerId
     && normaliseOrderSyncBaseUrl(current.settings.syncBaseUrl) === normaliseOrderSyncBaseUrl(expected.settings.syncBaseUrl)
@@ -1430,16 +1420,15 @@ function shouldScheduleNextOrderDomainRound(row: OrderDomainProgressRow | undefi
 
 async function scheduleNextOrderDomainRound(domain: OrderPollingDomain): Promise<void> {
   const nextSyncAt = new Date(Date.now() + cycleDelayForOrderDomain(domain) * 60_000).toISOString();
-  await runOrderSyncStateMutation(async () => {
-    const current = await getOrderSyncStateWithinMutation();
+  await orderSyncStateStore.update((current) => {
     const base = current.orderProgress ?? createDefaultOrderProgress();
-    await saveOrderSyncState({
+    return {
       ...current,
       orderProgress: {
         ...base,
         domains: { ...base.domains, [domain]: { ...base.domains[domain], nextSyncAt } },
       },
-    });
+    };
   });
   if (domain === 'orders') {
     await chrome.alarms.create(ORDER_SYNC_ALARM, {
@@ -3179,26 +3168,12 @@ async function fetchStatementSkuDetailRefs(
 /** 订单域：列表 1 次请求拿到全部字段，逐单上传（无需详情请求）。 */
 let logFlushInFlight = false;
 
-let orderSyncInFlight = false;
+const orderRunCoordinator = new OrderRunCoordinator();
 
-const orderDomainInFlight = new Set<Exclude<OrderPollingDomain, 'orders'>>();
-
-const stoppedOrderRunIds = new Set<string>();
-
-let manualOrderDomainSyncRequested = false;
-
-export interface OrderSyncLockSnapshot {
-  manualStartPending: boolean;
-  ordersInFlight: boolean;
-  domainsInFlight: OrderDomainKey[];
-}
+export type OrderSyncLockSnapshot = OrderRunLockSnapshot;
 
 export function getOrderSyncLockSnapshot(): OrderSyncLockSnapshot {
-  return {
-    manualStartPending: manualOrderDomainSyncRequested,
-    ordersInFlight: orderSyncInFlight,
-    domainsInFlight: [...orderDomainInFlight],
-  };
+  return orderRunCoordinator.snapshot();
 }
 
 let initialOrderDomainSyncStartedFor: string | null = null;
@@ -3225,15 +3200,14 @@ async function recordOrderProgress(
   note?: string,
   noteDetails: Record<string, unknown> = {},
 ): Promise<void> {
-  await runOrderSyncStateMutation(async () => {
-    const cur = await getOrderSyncStateWithinMutation();
+  await orderSyncStateStore.update((cur) => {
     if (expectedState && (cur.boundTab?.tabId !== expectedState.boundTab?.tabId
       || cur.boundTab?.sellerId !== expectedState.boundTab?.sellerId
       || normaliseOrderSyncBaseUrl(cur.settings.syncBaseUrl) !== normaliseOrderSyncBaseUrl(expectedState.settings.syncBaseUrl)
-      || cur.settings.syncToken.trim() !== expectedState.settings.syncToken.trim())) return;
+      || cur.settings.syncToken.trim() !== expectedState.settings.syncToken.trim())) return cur;
     const base = cur.orderProgress ?? createDefaultOrderProgress();
     const expectedRunId = expectedState?.orderProgress?.domains[domain]?.syncRunId;
-    if (expectedRunId && base.domains[domain]?.syncRunId !== expectedRunId) return;
+    if (expectedRunId && base.domains[domain]?.syncRunId !== expectedRunId) return cur;
     const progressAt = new Date().toISOString();
     const previousRow = base.domains[domain];
     const nextRow: OrderDomainProgressRow = {
@@ -3274,11 +3248,11 @@ async function recordOrderProgress(
           ...noteDetails,
         }),
     } satisfies OrderRuntimeLog];
-    await saveOrderSyncState({
+    return {
       ...cur,
       orderProgress: next,
       ...(tail.length === 0 ? {} : { runtimeLogs: [...cur.runtimeLogs, ...tail].slice(-MAX_RUNTIME_LOGS) }),
-    });
+    };
   });
 }
 
@@ -3292,19 +3266,16 @@ export async function recordOrderSyncRuntimeLog(
   message: string,
   details: Record<string, unknown> = {},
 ): Promise<void> {
-  await runOrderSyncStateMutation(async () => {
-    const current = await getOrderSyncStateWithinMutation();
-    await saveOrderSyncState({
-      ...current,
-      runtimeLogs: [...current.runtimeLogs, {
-        id: `order-sync-${domain}-${event}-${crypto.randomUUID()}`,
-        occurredAt: new Date().toISOString(),
-        level: outcome === 'failed' ? 'error' : 'info',
-        message,
-        context: runtimeLogContext('order_sync', event, outcome, { domain, ...details }),
-      } satisfies OrderRuntimeLog].slice(-MAX_RUNTIME_LOGS),
-    });
-  });
+  await orderSyncStateStore.update((current) => ({
+    ...current,
+    runtimeLogs: [...current.runtimeLogs, {
+      id: `order-sync-${domain}-${event}-${crypto.randomUUID()}`,
+      occurredAt: new Date().toISOString(),
+      level: outcome === 'failed' ? 'error' : 'info',
+      message,
+      context: runtimeLogContext('order_sync', event, outcome, { domain, ...details }),
+    } satisfies OrderRuntimeLog].slice(-MAX_RUNTIME_LOGS),
+  }));
 }
 
 
@@ -3353,55 +3324,55 @@ function orderPollingGateMessage(state: OrderSyncState, domain: string): string 
 
 
 export async function handleOrderSyncAlarm(trigger: OrderSyncTrigger = 'automatic'): Promise<boolean> {
-  if (trigger === 'automatic'
-    && (manualOrderDomainSyncRequested || orderSyncInFlight || orderDomainInFlight.size > 0)) {
-    await deferOrderDomainAlarm('orders');
-    await recordOrderSyncRuntimeLog('orders', 'alarm_deferred', 'skipped', '订单自动轮询因其他订单域任务占用而延后。', {
-      reason: manualOrderDomainSyncRequested ? 'manual_operation_active' : 'order_domain_busy',
-    });
-    return false;
-  }
-  if (orderSyncInFlight || orderDomainInFlight.size > 0) {
+  const result = await orderRunCoordinator.run({
+    domain: 'orders',
+    trigger,
+    onDeferred: async (reason) => {
+      await deferOrderDomainAlarm('orders');
+      await recordOrderSyncRuntimeLog('orders', 'alarm_deferred', 'skipped', '订单自动轮询因其他订单域任务占用而延后。', { reason });
+    },
+    work: async () => {
+      try {
+        await beginOrderDomainRun('orders', trigger);
+        await recordOrderSyncRuntimeLog('orders', 'alarm_started', 'started', '订单主动轮询开始。', { trigger });
+        const pagePipelineUsed = await handleOrderSyncAlarmOnce(trigger);
+        const current = await orderSyncStateStore.read();
+        const row = current.orderProgress?.domains.orders;
+        if (current.boundTab?.sellerId && current.settings.syncToken.trim()
+          && isOrderDomainSyncEnabled(current.settings) && shouldScheduleNextOrderDomainRound(row)) {
+          await scheduleNextOrderDomainRound('orders');
+        }
+        await recordOrderSyncRuntimeLog(
+          'orders',
+          'alarm_completed',
+          row?.lastError ? 'failed' : 'succeeded',
+          row?.lastError ? '订单主动轮询结束，但存在失败。' : '订单主动轮询结束。',
+          {
+            trigger,
+            status: current.orderProgress?.status ?? 'idle',
+            total: row?.total ?? 0,
+            uploaded: row?.uploaded ?? 0,
+            pending: row?.pending ?? 0,
+            lastError: row?.lastError ?? null,
+          },
+        );
+        return pagePipelineUsed;
+      } catch (error) {
+        await recordOrderSyncRuntimeLog('orders', 'alarm_failed', 'failed', '订单主动轮询异常退出。', {
+          trigger,
+          error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
+        });
+        throw error;
+      }
+    },
+  });
+  if (result.status === 'skipped') {
     await recordOrderSyncRuntimeLog('orders', 'alarm_skipped', 'skipped', '订单主动轮询跳过：上一轮仍在执行。', {
-      reason: 'in_flight',
+      reason: result.reason,
     });
     return false;
   }
-  orderSyncInFlight = true;
-  try {
-    await beginOrderDomainRun('orders', trigger);
-    await recordOrderSyncRuntimeLog('orders', 'alarm_started', 'started', '订单主动轮询开始。', { trigger });
-    const pagePipelineUsed = await handleOrderSyncAlarmOnce(trigger);
-    const current = await getOrderSyncState();
-    const row = current.orderProgress?.domains.orders;
-    if (current.boundTab?.sellerId && current.settings.syncToken.trim()
-      && isOrderDomainSyncEnabled(current.settings) && shouldScheduleNextOrderDomainRound(row)) {
-      await scheduleNextOrderDomainRound('orders');
-    }
-    await recordOrderSyncRuntimeLog(
-      'orders',
-      'alarm_completed',
-      row?.lastError ? 'failed' : 'succeeded',
-      row?.lastError ? '订单主动轮询结束，但存在失败。' : '订单主动轮询结束。',
-      {
-        trigger,
-        status: current.orderProgress?.status ?? 'idle',
-        total: row?.total ?? 0,
-        uploaded: row?.uploaded ?? 0,
-        pending: row?.pending ?? 0,
-        lastError: row?.lastError ?? null,
-      },
-    );
-    return pagePipelineUsed;
-  } catch (error) {
-    await recordOrderSyncRuntimeLog('orders', 'alarm_failed', 'failed', '订单主动轮询异常退出。', {
-      trigger,
-      error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
-    });
-    throw error;
-  } finally {
-    orderSyncInFlight = false;
-  }
+  return result.status === 'completed' ? result.value : false;
 }
 
 
@@ -3435,7 +3406,7 @@ function createOrderPagePipeline(
   const drainLogisticsQueue = async (): Promise<void> => {
     if (logisticsQueueRunning) return;
     logisticsQueueRunning = true;
-    orderDomainInFlight.add('logistics');
+    const releaseRun = orderRunCoordinator.reserve('logistics');
     try {
       const startedState = await beginOrderDomainRun('logistics', trigger);
       const runState = withCurrentOrderDomainRun(state, startedState, 'logistics');
@@ -3458,7 +3429,7 @@ function createOrderPagePipeline(
               scheduleContinuation: item.scheduleContinuation,
             },
           );
-          const afterLogistics = await getOrderSyncState();
+          const afterLogistics = await orderSyncStateStore.read();
           (afterLogistics.orderProgress?.domains.logistics.failedOrderIds ?? [])
             .forEach((orderId) => logisticsFailedOrderIds.add(orderId));
           logisticsUploaded = Math.max(
@@ -3476,7 +3447,7 @@ function createOrderPagePipeline(
       }
     } finally {
       logisticsQueueRunning = false;
-      orderDomainInFlight.delete('logistics');
+      releaseRun();
     }
   };
 
@@ -3512,7 +3483,7 @@ function createOrderPagePipeline(
   const drainDetailsQueue = async (): Promise<void> => {
     if (detailsQueueRunning) return;
     detailsQueueRunning = true;
-    orderDomainInFlight.add('order_details');
+    const releaseRun = orderRunCoordinator.reserve('order_details');
     try {
       const startedState = await beginOrderDomainRun('order_details', trigger);
       const runState = withCurrentOrderDomainRun(state, startedState, 'order_details');
@@ -3530,7 +3501,7 @@ function createOrderPagePipeline(
               scheduleContinuation: item.scheduleContinuation,
             },
           );
-          const afterDetails = await getOrderSyncState();
+          const afterDetails = await orderSyncStateStore.read();
           (afterDetails.orderProgress?.domains.order_details.failedOrderIds ?? [])
             .forEach((orderId) => detailsFailedOrderIds.add(orderId));
           detailsUploaded = Math.max(
@@ -3548,7 +3519,7 @@ function createOrderPagePipeline(
       }
     } finally {
       detailsQueueRunning = false;
-      orderDomainInFlight.delete('order_details');
+      releaseRun();
     }
   };
 
@@ -3579,7 +3550,7 @@ function createOrderPagePipeline(
   const drainHistoryQueue = async (): Promise<void> => {
     if (historyQueueRunning) return;
     historyQueueRunning = true;
-    orderDomainInFlight.add('order_history');
+    const releaseRun = orderRunCoordinator.reserve('order_history');
     try {
       const startedState = await beginOrderDomainRun('order_history', trigger);
       const runState = withCurrentOrderDomainRun(state, startedState, 'order_history');
@@ -3597,7 +3568,7 @@ function createOrderPagePipeline(
               scheduleContinuation: item.scheduleContinuation,
             },
           );
-          const afterHistory = await getOrderSyncState();
+          const afterHistory = await orderSyncStateStore.read();
           (afterHistory.orderProgress?.domains.order_history.failedOrderIds ?? [])
             .forEach((orderId) => historyFailedOrderIds.add(orderId));
           historyUploaded = Math.max(
@@ -3615,7 +3586,7 @@ function createOrderPagePipeline(
       }
     } finally {
       historyQueueRunning = false;
-      orderDomainInFlight.delete('order_history');
+      releaseRun();
     }
   };
 
@@ -3702,14 +3673,14 @@ function createOrderPagePipeline(
           scheduleContinuation: false,
         },
       );
-      const afterChunk = await getOrderSyncState();
+      const afterChunk = await orderSyncStateStore.read();
       const chunkFailed = new Set(afterChunk.orderProgress?.domains.orders.failedOrderIds ?? []);
       chunkFailed.forEach((orderId) => failedOrderIds.add(orderId));
       const currentChunkFailed = chunk.filter((entry) => chunkFailed.has(entry.key)).length;
       pageProcessed += Math.max(0, chunk.length - currentChunkFailed);
     }
 
-    const afterOrders = await getOrderSyncState();
+    const afterOrders = await orderSyncStateStore.read();
     const pageFailed = new Set(afterOrders.orderProgress?.domains.orders.failedOrderIds ?? []);
     pageFailed.forEach((orderId) => failedOrderIds.add(orderId));
     uploaded += pageProcessed;
@@ -3793,7 +3764,7 @@ function createOrderPagePipeline(
 
 
 async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<boolean> {
-  const rawState = await getOrderSyncState();
+  const rawState = await orderSyncStateStore.read();
   const state = await orderPollingState();
   if (!state) {
     await recordOrderSyncRuntimeLog('orders', 'poll_skipped', 'skipped', orderPollingGateMessage(rawState, '订单'), orderPollingGateDetails(rawState));
@@ -3847,7 +3818,7 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
     await pagePipeline.drain();
   }
   if (selection.streamed) {
-    const streamedState = await getOrderSyncState();
+    const streamedState = await orderSyncStateStore.read();
     const streamedRow = streamedState.orderProgress?.domains.orders;
     if ((streamedRow?.listRowsFetched ?? 0) === 0) {
       const message = '订单列表本页返回 0 行，保留已有断点并等待下一轮重试。';
@@ -3980,7 +3951,7 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
     })),
     selection.serverTotal ?? 0,
   );
-  const completedState = await getOrderSyncState();
+  const completedState = await orderSyncStateStore.read();
   const completedRow = completedState.orderProgress?.domains.orders;
   if (selection.checkpoint && completedRow?.pending === 0 && (completedRow.failed ?? 0) === 0) {
     await recordOrderProgress('orders', { orderListCheckpoint: selection.checkpoint }, 'ok', state);
@@ -3994,59 +3965,57 @@ export async function pollOrderDomain(
   domain: Exclude<OrderPollingDomain, 'orders'>,
   trigger: OrderSyncTrigger = 'automatic',
 ): Promise<void> {
-  if (trigger === 'automatic'
-    && (manualOrderDomainSyncRequested || orderSyncInFlight || orderDomainInFlight.size > 0)) {
-    await deferOrderDomainAlarm(domain);
-    await recordOrderSyncRuntimeLog(domain, 'alarm_deferred', 'skipped', `${domain} 自动轮询因其他订单域任务占用而延后。`, {
-      reason: manualOrderDomainSyncRequested ? 'manual_operation_active' : 'order_domain_busy',
-    });
-    return;
-  }
-  if (orderSyncInFlight || orderDomainInFlight.has(domain)) {
+  const result = await orderRunCoordinator.run({
+    domain,
+    trigger,
+    onDeferred: async (reason) => {
+      await deferOrderDomainAlarm(domain);
+      await recordOrderSyncRuntimeLog(domain, 'alarm_deferred', 'skipped', `${domain} 自动轮询因其他订单域任务占用而延后。`, { reason });
+    },
+    work: async () => {
+      try {
+        await beginOrderDomainRun(domain, trigger);
+        await recordOrderSyncRuntimeLog(domain, 'alarm_started', 'started', `${domain} 主动轮询开始。`, { trigger });
+        await pollOrderDomainOnce(domain);
+        const current = await orderSyncStateStore.read();
+        const row = current.orderProgress?.domains[domain];
+        if (current.boundTab?.sellerId && current.settings.syncToken.trim()
+          && isOrderDomainSyncEnabled(current.settings) && shouldScheduleNextOrderDomainRound(row)) {
+          await scheduleNextOrderDomainRound(domain);
+        }
+        await recordOrderSyncRuntimeLog(
+          domain,
+          'alarm_completed',
+          row?.lastError ? 'failed' : 'succeeded',
+          row?.lastError ? `${domain} 主动轮询结束，但存在失败。` : `${domain} 主动轮询结束。`,
+          {
+            trigger,
+            status: current.orderProgress?.status ?? 'idle',
+            total: row?.total ?? 0,
+            uploaded: row?.uploaded ?? 0,
+            pending: row?.pending ?? 0,
+            lastError: row?.lastError ?? null,
+          },
+        );
+      } catch (error) {
+        await recordOrderSyncRuntimeLog(domain, 'alarm_failed', 'failed', `${domain} 主动轮询异常退出。`, {
+          trigger,
+          error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
+        });
+        throw error;
+      }
+    },
+  });
+  if (result.status === 'skipped') {
     await recordOrderSyncRuntimeLog(domain, 'alarm_skipped', 'skipped', `${domain} 主动轮询跳过：上一轮仍在执行。`, {
-      reason: 'in_flight',
+      reason: result.reason,
     });
-    return;
-  }
-  orderDomainInFlight.add(domain);
-  try {
-    await beginOrderDomainRun(domain, trigger);
-    await recordOrderSyncRuntimeLog(domain, 'alarm_started', 'started', `${domain} 主动轮询开始。`, { trigger });
-    await pollOrderDomainOnce(domain);
-    const current = await getOrderSyncState();
-    const row = current.orderProgress?.domains[domain];
-    if (current.boundTab?.sellerId && current.settings.syncToken.trim()
-      && isOrderDomainSyncEnabled(current.settings) && shouldScheduleNextOrderDomainRound(row)) {
-      await scheduleNextOrderDomainRound(domain);
-    }
-    await recordOrderSyncRuntimeLog(
-      domain,
-      'alarm_completed',
-      row?.lastError ? 'failed' : 'succeeded',
-      row?.lastError ? `${domain} 主动轮询结束，但存在失败。` : `${domain} 主动轮询结束。`,
-      {
-        trigger,
-        status: current.orderProgress?.status ?? 'idle',
-        total: row?.total ?? 0,
-        uploaded: row?.uploaded ?? 0,
-        pending: row?.pending ?? 0,
-        lastError: row?.lastError ?? null,
-      },
-    );
-  } catch (error) {
-    await recordOrderSyncRuntimeLog(domain, 'alarm_failed', 'failed', `${domain} 主动轮询异常退出。`, {
-      trigger,
-      error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
-    });
-    throw error;
-  } finally {
-    orderDomainInFlight.delete(domain);
   }
 }
 
 
 async function launchManualOrderDomainSync(retryFailedOnly: boolean): Promise<void> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   const ALL_MANUAL_DOMAINS: OrderPollingDomain[] = ['orders', 'logistics', 'statements', 'order_details', 'order_history'];
   const domains: OrderPollingDomain[] = retryFailedOnly
     ? ALL_MANUAL_DOMAINS.filter((domain) => {
@@ -4082,7 +4051,7 @@ async function launchManualOrderDomainSync(retryFailedOnly: boolean): Promise<vo
 
 
 export async function requestManualOrderDomainSync(retryFailedOnly: boolean): Promise<{ accepted: true }> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (!current.boundTab?.sellerId || !current.settings.syncToken.trim() || !isOrderDomainSyncEnabled(current.settings)) {
     throw new Error('请先绑定店铺并完成订单同步配置。');
   }
@@ -4096,46 +4065,34 @@ export async function requestManualOrderDomainSync(retryFailedOnly: boolean): Pr
     throw new Error('订单相关同步正在运行，请等待当前任务完成。');
   }
   if (running.length > 0) throw new Error('存在卡住的同步任务，请使用“停止卡住任务并重试”进行恢复。');
-  if (manualOrderDomainSyncRequested || orderSyncInFlight || orderDomainInFlight.size > 0) {
-    throw new Error('后台同步任务正在收尾，请稍后再试。');
-  }
-  manualOrderDomainSyncRequested = true;
+  const releaseManual = orderRunCoordinator.beginManual({ requireIdle: true });
+  if (!releaseManual) throw new Error('后台同步任务正在收尾，请稍后再试。');
   void launchManualOrderDomainSync(retryFailedOnly)
     .catch(reportSchedulerError)
-    .finally(() => { manualOrderDomainSyncRequested = false; });
+    .finally(releaseManual);
   return { accepted: true };
 }
 
 
-async function waitForOrderDomainsIdle(): Promise<boolean> {
-  const deadline = Date.now() + ORDER_DOMAIN_STOP_WAIT_MS;
-  while ((orderSyncInFlight || orderDomainInFlight.size > 0) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  return !orderSyncInFlight && orderDomainInFlight.size === 0;
-}
-
-
 export async function stopStuckOrderDomainAndRetry(domain: OrderDomainKey): Promise<{ accepted: true }> {
-  if (manualOrderDomainSyncRequested) throw new Error('已有手动订单同步操作正在启动，请稍后再试。');
-  const current = await getOrderSyncState();
+  if (orderRunCoordinator.snapshot().manualStartPending) throw new Error('已有手动订单同步操作正在启动，请稍后再试。');
+  const current = await orderSyncStateStore.read();
   const row = current.orderProgress?.domains[domain];
-  if (manualOrderDomainSyncRequested) throw new Error('已有手动订单同步操作正在启动，请稍后再试。');
   if (!orderDomainIsStuck(row)) throw new Error('该同步任务已有进展，无需停止；请等待它完成。');
-  manualOrderDomainSyncRequested = true;
+  const releaseManual = orderRunCoordinator.beginManual({ requireIdle: false });
+  if (!releaseManual) throw new Error('已有手动订单同步操作正在启动，请稍后再试。');
   let retryStartedInBackground = false;
   try {
     const oldRunId = row?.syncRunId;
     const replacementRunId = crypto.randomUUID();
     const now = new Date().toISOString();
-    await runOrderSyncStateMutation(async () => {
-      const latest = await getOrderSyncStateWithinMutation();
+    await orderSyncStateStore.update((latest) => {
       const base = latest.orderProgress ?? createDefaultOrderProgress();
       const latestRow = base.domains[domain];
       if (latestRow.syncRunId !== oldRunId || !orderDomainIsStuck(latestRow)) {
         throw new Error('同步状态刚刚更新，请刷新后再操作。');
       }
-      await saveOrderSyncState({
+      return {
         ...latest,
         orderProgress: {
           ...base,
@@ -4151,29 +4108,29 @@ export async function stopStuckOrderDomainAndRetry(domain: OrderDomainKey): Prom
             },
           },
         },
-      });
+      };
     });
-    if (oldRunId) stoppedOrderRunIds.add(oldRunId);
+    orderRunCoordinator.stopRun(oldRunId);
     const mainAlarm = domain === 'orders' ? ORDER_SYNC_ALARM : domain === 'logistics' ? LOGISTICS_SYNC_ALARM : domain === 'order_details' ? ORDER_DETAILS_SYNC_ALARM : domain === 'order_history' ? ORDER_HISTORY_SYNC_ALARM : SETTLEMENT_SYNC_ALARM;
     if (typeof chrome.alarms.clear === 'function') {
       await chrome.alarms.clear(mainAlarm);
       await chrome.alarms.clear(continuationAlarmForOrderDomain(domain));
     }
-    if (!await waitForOrderDomainsIdle()) {
+    if (!await orderRunCoordinator.waitForIdle(ORDER_DOMAIN_STOP_WAIT_MS)) {
       throw new Error('旧任务或其他订单域任务仍在收尾。进度已保留，请稍后点“重试失败项”继续。');
     }
     const retry = domain === 'orders' ? handleOrderSyncAlarm('manual') : pollOrderDomain(domain, 'manual');
     retryStartedInBackground = true;
-    void retry.catch(reportSchedulerError).finally(() => { manualOrderDomainSyncRequested = false; });
+    void retry.catch(reportSchedulerError).finally(releaseManual);
     return { accepted: true };
   } finally {
-    if (!retryStartedInBackground) manualOrderDomainSyncRequested = false;
+    if (!retryStartedInBackground) releaseManual();
   }
 }
 
 
 async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>): Promise<void> {
-  const rawState = await getOrderSyncState();
+  const rawState = await orderSyncStateStore.read();
   const state = await orderPollingState();
   if (!state) {
     await recordOrderSyncRuntimeLog(domain, 'poll_skipped', 'skipped', orderPollingGateMessage(rawState, domain), orderPollingGateDetails(rawState));
@@ -4520,7 +4477,7 @@ export async function ensureBoundDomainAlarms(
   // 启动 3 秒探活轮询（setInterval，非 chrome.alarms）
   startHealthPolling(
     async () => {
-      const state = await getOrderSyncState();
+      const state = await orderSyncStateStore.read();
       return state.settings.syncBaseUrl?.trim() || undefined;
     },
     (healthy, healthState) => {
@@ -4594,7 +4551,7 @@ export async function runInitialOrderDomainSync(
       await pollOrderDomain('order_details');
       await pollOrderDomain('order_history');
     }
-    const current = await getOrderSyncState();
+    const current = await orderSyncStateStore.read();
     const pendingDomains = (['orders', 'logistics', 'statements'] as const)
       .filter((domain) => !isOrderDomainRoundSettled(current.orderProgress?.domains[domain]));
     // order_details 和 order_history 由 pipeline 自动入队，不在首次同步的 pending 域列表中报告。
@@ -4618,7 +4575,7 @@ export async function runInitialOrderDomainSync(
 
 
 async function maybeStartInitialOrderDomainSync(trigger: InitialOrderSyncTrigger): Promise<void> {
-  const rawState = await getOrderSyncState();
+  const rawState = await orderSyncStateStore.read();
   const state = await orderPollingState();
   if (!state) {
     if (rawState.boundTab && rawState.settings.syncToken.trim() && isOrderDomainSyncEnabled(rawState.settings)) {
@@ -4679,7 +4636,7 @@ async function ensureBoundAlarm(
   nextDelayMinutes: number,
   domain: OrderPollingDomain,
 ): Promise<void> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   const boundTab = state.boundTab;
   if (!boundTab?.sellerId || !isOrderDomainSyncEnabled(state.settings)) {
     if (typeof chrome.alarms.clear === 'function') {
@@ -4696,7 +4653,7 @@ async function ensureBoundAlarm(
   }
   // 正在处理的批次会在 finally 前安排续传或下一整轮。心跳在此时创建
   // 主 alarm 会同续传竞争，造成同一域无意义的 alarm_skipped 日志。
-  if (domain === 'orders' ? orderSyncInFlight : orderDomainInFlight.has(domain)) return;
+  if (orderRunCoordinator.isActive(domain)) return;
   const continuation = await chrome.alarms.get(continuationAlarmForOrderDomain(domain));
   if (continuation) return;
   const row = state.orderProgress?.domains[domain];
@@ -4730,7 +4687,7 @@ function orderDomainIsStuck(row: OrderDomainProgressRow | undefined, now = Date.
 
 
 function orderDomainIsInFlight(domain: OrderPollingDomain): boolean {
-  return domain === 'orders' ? orderSyncInFlight : orderDomainInFlight.has(domain);
+  return orderRunCoordinator.isActive(domain);
 }
 
 
@@ -4738,12 +4695,12 @@ async function beginOrderDomainRun(
   domain: OrderPollingDomain,
   trigger: OrderSyncTrigger,
 ): Promise<OrderSyncState> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   const previous = current.orderProgress.domains[domain];
   // A continuation alarm resumes the same durable run and trigger.
   if (previous.syncRunStatus === 'running' && previous.syncRunId) {
     await recordOrderProgress(domain, { lastProgressAt: new Date().toISOString() }, 'running');
-    return getOrderSyncState();
+    return orderSyncStateStore.read();
   }
   const now = new Date().toISOString();
   await recordOrderProgress(domain, {
@@ -4752,7 +4709,7 @@ async function beginOrderDomainRun(
     syncRunStatus: 'running',
     lastProgressAt: now,
   }, 'running');
-  return getOrderSyncState();
+  return orderSyncStateStore.read();
 }
 
 
@@ -4775,150 +4732,11 @@ function withCurrentOrderDomainRun(
 
 
 function isOrderDomainRunCurrent(domain: OrderPollingDomain, expectedState: OrderSyncState): boolean {
-  const expectedRunId = expectedState.orderProgress?.domains[domain]?.syncRunId;
-  return !expectedRunId || !stoppedOrderRunIds.has(expectedRunId);
+  return orderRunCoordinator.isRunCurrent(expectedState.orderProgress?.domains[domain]?.syncRunId);
 }
 
 
-/**
- * Reuse the authenticated page session for TikTok requests. Extension-worker
- * fetches do not reliably carry the Seller Center's page-scoped session.
- */
-async function executeTikTokRequestInBoundPage(
-  tabId: number | undefined,
-  url: string,
-  body: Record<string, unknown>,
-  signal: AbortSignal,
-  method: 'GET' | 'POST' = 'POST',
-  requestId: string = crypto.randomUUID(),
-  timeoutMs = ORDER_PAGE_REQUEST_TIMEOUT_MS,
-): Promise<BoundTikTokResponse> {
-  if (signal.aborted) throw new DOMException('Request aborted', 'AbortError');
-  const tabsApi = globalThis.chrome?.tabs;
-  if (tabsApi?.sendMessage && tabId !== undefined) {
-    const proxyRequest: PageProxyRequestPayload = {
-      requestId,
-      url,
-      method,
-      body,
-      timeoutMs,
-    };
-    let abortHandler: (() => void) | undefined;
-    try {
-      const execution = tabsApi.sendMessage(tabId, {
-        type: 'order-sync:page-request',
-        payload: proxyRequest,
-      });
-      const aborted = new Promise<never>((_, reject) => {
-        abortHandler = () => reject(new DOMException('Request aborted', 'AbortError'));
-        if (signal.aborted) abortHandler();
-        else signal.addEventListener('abort', abortHandler, { once: true });
-      });
-      const bridgeResult = await Promise.race([execution, aborted]);
-      if (signal.aborted) throw new DOMException('Request aborted', 'AbortError');
-      if (!isRecord(bridgeResult)) {
-        throw Object.assign(new Error('页面请求代理未返回结果。'), { name: 'PageProxyResponseMissingError' });
-      }
-      if (bridgeResult.ok !== true) {
-        const errorName = typeof bridgeResult.errorName === 'string'
-          ? bridgeResult.errorName : 'PageProxyRequestError';
-        const errorMessage = typeof bridgeResult.errorMessage === 'string'
-          ? bridgeResult.errorMessage : '页面请求代理执行失败。';
-        throw Object.assign(new Error(errorMessage), { name: errorName });
-      }
-      if (!isBoundTikTokResponse(bridgeResult.response)) {
-        throw Object.assign(new Error('页面请求代理返回了无效响应。'), { name: 'PageProxyResponseInvalidError' });
-      }
-      return {
-        ...materializePageProxyResponse(bridgeResult.response),
-        requestMode: 'page_proxy',
-      };
-    } catch (error) {
-      if (signal.aborted) {
-        void tabsApi.sendMessage(tabId, {
-          type: 'order-sync:page-cancel',
-          payload: { requestId },
-        }).catch(() => undefined);
-        throw new DOMException('Request aborted', 'AbortError');
-      }
-      // Old tabs or pages opened before the content bridge was installed use
-      // the one-request executeScript compatibility path below. Never retry a
-      // real page-side TikTok error, otherwise the API would receive a duplicate.
-      if (!isPageProxyUnavailableError(error)) throw error;
-    } finally {
-      if (abortHandler) signal.removeEventListener('abort', abortHandler);
-    }
-  }
-  const scriptingApi = globalThis.chrome?.scripting;
-  if (scriptingApi?.executeScript && tabId !== undefined) {
-    let injected: chrome.scripting.InjectionResult<BoundTikTokResponse>[];
-    let abortHandler: (() => void) | undefined;
-    try {
-      const execution = scriptingApi.executeScript({
-        target: { tabId },
-        world: 'MAIN',
-        func: fetchTikTokResponse,
-        // AbortSignal is not structured-cloneable. Pass a duration so the
-        // serialized MAIN-world function can cancel its own fetch instead.
-        // Keep every argument structured-cloneable. In particular, an
-        // explicit undefined here makes Chrome reject the whole injection
-        // before the Seller Center request is executed.
-        args: [url, body, method, timeoutMs, null, true, {
-          storageKey: SELLER_PAGE_COORDINATION_KEY,
-          requestId,
-          leaseMs: SELLER_PAGE_REQUEST_LEASE_MS,
-        }],
-      });
-      const aborted = new Promise<never>((_, reject) => {
-        abortHandler = () => reject(new DOMException('Request aborted', 'AbortError'));
-        if (signal.aborted) abortHandler();
-        else signal.addEventListener('abort', abortHandler, { once: true });
-      });
-      injected = await Promise.race([execution, aborted]);
-    } catch (error) {
-      if (signal.aborted) throw new DOMException('Request aborted', 'AbortError');
-      const message = error instanceof Error ? error.message : String(error);
-      throw Object.assign(new Error(`executeScript TikTok 请求失败: ${sanitizeDiagnosticText(message).slice(0, 240)}`), {
-        name: 'TikTokExecuteScriptError',
-        cause: error,
-      });
-    } finally {
-      if (abortHandler) signal.removeEventListener('abort', abortHandler);
-    }
-    if (signal.aborted) throw new DOMException('Request aborted', 'AbortError');
-    const result = injected[0]?.result;
-    if (!isBoundTikTokResponse(result))
-      throw Object.assign(new Error('绑定页面未返回可用的 TikTok 响应'), { name: 'TikTokBoundResponseMissingError' });
-    return { ...result, requestMode: 'main_execute_script' };
-  }
-
-  return {
-    ...(await fetchTikTokResponse(url, body, method, signal)),
-    requestMode: 'worker_fetch',
-  };
-}
-
-
-function materializePageProxyResponse(response: BoundTikTokResponse): BoundTikTokResponse {
-  if (response.payload !== null || typeof response.responseText !== 'string') return response;
-  try {
-    const payload = JSON.parse(response.responseText) as unknown;
-    const { responseText: _responseText, ...withoutText } = response;
-    return { ...withoutText, payload };
-  } catch {
-    return { ...response, responseReadError: response.responseReadError ?? 'response-not-json' };
-  }
-}
-
-
-function isPageProxyUnavailableError(error: unknown): boolean {
-  if (error instanceof Error && (
-    error.name === 'PageProxyUnavailableError'
-    || error.name === 'PageProxyResponseMissingError'
-  )) return true;
-  const message = error instanceof Error ? error.message : String(error);
-  return /Receiving end does not exist|Could not establish connection|message port closed|no response was received/i.test(message);
-}
+const boundPageTransport = createChromeBoundPageTransport();
 
 
 async function executeTikTokRequestWithTimeout(
@@ -4938,7 +4756,15 @@ async function executeTikTokRequestWithTimeout(
   }, timeoutMs);
   try {
     assertTikTokEndpointCircuitClosed(url);
-    const response = await executeTikTokRequestInBoundPage(tabId, url, body, controller.signal, method, crypto.randomUUID(), timeoutMs);
+    const response = await boundPageTransport.request({
+      tabId,
+      url,
+      body,
+      signal: controller.signal,
+      method,
+      requestId: crypto.randomUUID(),
+      timeoutMs,
+    });
     await noteTikTokEndpointResponse(url, response);
     return response;
   } catch (error) {
@@ -5023,15 +4849,6 @@ function nullPayloadDiagnostic(detail: BoundTikTokResponse): string {
   if (typeof detail.responseTextLength === 'number') parts.push(`${detail.responseTextLength}B`);
   if (detail.responseContentType) parts.push(detail.responseContentType);
   return parts.join(', ');
-}
-
-
-function isBoundTikTokResponse(value: unknown): value is BoundTikTokResponse {
-  return isRecord(value) &&
-    typeof value.ok === 'boolean' &&
-    typeof value.status === 'number' &&
-    Number.isFinite(value.status) &&
-    Object.hasOwn(value, 'payload');
 }
 
 
