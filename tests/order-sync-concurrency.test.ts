@@ -18,18 +18,16 @@ vi.mock('../src/extension/storage', async () => {
   const saveOrderSyncState = async (state: OrderSyncState) => {
     harness.state = structuredClone(state);
   };
+  const read = async () => structuredClone(harness.state!);
+  const update = (mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>) =>
+    runOrderSyncStateMutation(async () => {
+      const next = await mutation(await read());
+      await saveOrderSyncState(next);
+      return structuredClone(next);
+    });
   return {
     ...actual,
-    getOrderSyncState: async () => structuredClone(harness.state!),
-    getOrderSyncStateWithinMutation: async () => structuredClone(harness.state!),
-    runOrderSyncStateMutation,
-    saveOrderSyncState,
-    mutateOrderSyncState: (mutation: (state: OrderSyncState) => OrderSyncState | Promise<OrderSyncState>) =>
-      runOrderSyncStateMutation(async () => {
-        const next = await mutation(structuredClone(harness.state!));
-        await saveOrderSyncState(next);
-        return structuredClone(next);
-      }),
+    orderSyncStateStore: { read, update },
   };
 });
 

@@ -1,7 +1,7 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import { normalizeOrderSyncBaseUrl, normalizeOrderSyncSettings } from '../src/core/settings';
 import type { OrderExtensionMessage } from '../src/extension/messages';
-import { createDefaultOrderProgress, getOrderSyncState, mutateOrderSyncState } from '../src/extension/storage';
+import { createDefaultOrderProgress, orderSyncStateStore } from '../src/extension/storage';
 import type { OrderDomainKey, OrderSyncState } from '../src/core/types';
 import {
   claimSellerPageRefresh,
@@ -88,7 +88,7 @@ async function initializeBackground(): Promise<void> {
 }
 
 async function recoverSellerBindingOnStartup(): Promise<void> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (current.sellerBinding.mode === 'auto') {
     const deadlineAt = Date.parse(current.sellerBinding.deadlineAt ?? '');
     if (current.settings.syncToken.trim() && Number.isFinite(deadlineAt) && deadlineAt > Date.now()) {
@@ -102,7 +102,7 @@ async function recoverSellerBindingOnStartup(): Promise<void> {
       return;
     }
     const hasSellerId = Boolean(current.boundTab?.sellerId);
-    await mutateOrderSyncState((state) => state.sellerBinding.mode === 'auto'
+    await orderSyncStateStore.update((state) => state.sellerBinding.mode === 'auto'
       ? {
         ...state,
         boundTab: hasSellerId ? state.boundTab : null,
@@ -124,7 +124,7 @@ async function recoverSellerBindingOnStartup(): Promise<void> {
 
   if (current.sellerBinding.mode === 'manual') {
     const hasSellerId = Boolean(current.boundTab?.sellerId);
-    await mutateOrderSyncState((state) => state.sellerBinding.mode === 'manual'
+    await orderSyncStateStore.update((state) => state.sellerBinding.mode === 'manual'
       ? {
         ...state,
         sellerBinding: {
@@ -148,7 +148,7 @@ export async function handleOrderMessage(
 ): Promise<unknown> {
   switch (message.type) {
     case 'order-sync:get-state': {
-      const state = await getOrderSyncState();
+      const state = await orderSyncStateStore.read();
       return { ...state, ttsErpHealth: getTtsErpHealthState() };
     }
     case 'order-sync:save-settings': {
@@ -156,7 +156,7 @@ export async function handleOrderMessage(
       if (settings.syncBaseUrl && !isHttpUrl(settings.syncBaseUrl)) throw new Error('同步地址必须是有效的 HTTP(S) URL。');
       let shouldStartAutoBinding = false;
       let circuitResetRequested = false;
-      const next = await mutateOrderSyncState((current) => {
+      const next = await orderSyncStateStore.update((current) => {
         circuitResetRequested = current.settings.syncPaused && !settings.syncPaused;
         const destinationChanged = normalizeOrderSyncBaseUrl(current.settings.syncBaseUrl)
           !== normalizeOrderSyncBaseUrl(settings.syncBaseUrl)
@@ -193,10 +193,10 @@ export async function handleOrderMessage(
       return unbindCurrentSellerTab();
     case 'order-sync:sync-domains':
       await requestManualOrderDomainSync(message.retryFailedOnly === true);
-      return getOrderSyncState();
+      return orderSyncStateStore.read();
     case 'order-sync:stop-stuck-domain':
       await stopStuckOrderDomainAndRetry(message.domain);
-      return getOrderSyncState();
+      return orderSyncStateStore.read();
     case 'order-sync:capture-seller':
       return captureSellerIdentity(message.payload, sender);
   }
@@ -205,11 +205,11 @@ export async function handleOrderMessage(
 async function bindCurrentSellerTab(): Promise<OrderSyncState> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tab?.id === undefined || !isSellerCenterUrl(tab.url)) throw new Error('请先打开 TikTok Shop Seller Center 页面。');
-  const existing = await getOrderSyncState();
+  const existing = await orderSyncStateStore.read();
   if (existing.sellerBinding.mode !== 'idle') {
     throw new Error(existing.sellerBinding.mode === 'auto' ? '自动绑定正在进行，请等待自动绑定结束或超时。' : '手动绑定正在进行，请稍候。');
   }
-  await mutateOrderSyncState((current) => {
+  await orderSyncStateStore.update((current) => {
     if (current.sellerBinding.mode !== 'idle') {
       throw new Error(current.sellerBinding.mode === 'auto' ? '自动绑定正在进行，请等待自动绑定结束或超时。' : '手动绑定正在进行，请稍候。');
     }
@@ -242,7 +242,7 @@ async function bindCurrentSellerTab(): Promise<OrderSyncState> {
     await probeAndCaptureSellerIdentity(tab);
     await ensureBoundAlarms();
   } finally {
-    await mutateOrderSyncState((current) => current.sellerBinding.mode === 'manual'
+    await orderSyncStateStore.update((current) => current.sellerBinding.mode === 'manual'
       ? {
         ...current,
         sellerBinding: {
@@ -253,12 +253,12 @@ async function bindCurrentSellerTab(): Promise<OrderSyncState> {
       }
       : current);
   }
-  return getOrderSyncState();
+  return orderSyncStateStore.read();
 }
 
 async function unbindCurrentSellerTab(): Promise<OrderSyncState> {
   autoBindingRunId += 1;
-  const next = await mutateOrderSyncState((state) => ({
+  const next = await orderSyncStateStore.update((state) => ({
     ...state,
     boundTab: null,
     sellerBinding: { mode: 'idle', outcome: 'none', deadlineAt: null },
@@ -281,7 +281,7 @@ async function captureSellerIdentity(
   sender: chrome.runtime.MessageSender,
 ): Promise<OrderSyncState> {
   const senderTabId = sender.tab?.id;
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (senderTabId === undefined || !isSellerCenterUrl(payload.url) || !payload.sellerId.trim()) {
     await recordOrderSyncRuntimeLog('all', 'seller_identity_ignored', 'skipped', '忽略无效的 Seller ID 捕获消息。', {
       stage: 'seller_binding',
@@ -309,7 +309,7 @@ async function captureSellerIdentity(
     return current;
   }
   const capturedFromBoundTab = current.boundTab?.tabId === senderTabId;
-  const next = await mutateOrderSyncState((current) => {
+  const next = await orderSyncStateStore.update((current) => {
     const boundTab = current.boundTab;
     if (!boundTab || (boundTab.tabId !== senderTabId && !sameSellerCenterOrigin)) return current;
     const sellerId = payload.sellerId.trim();
@@ -364,7 +364,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
   const deadlineAt = Number.isFinite(requestedDeadlineAt) && requestedDeadlineAt! > Date.now()
     ? requestedDeadlineAt!
     : Date.now() + AUTO_BIND_TIMEOUT_MS;
-  const activated = await mutateOrderSyncState((current) => {
+  const activated = await orderSyncStateStore.update((current) => {
     if (runId !== autoBindingRunId
       || (current.sellerBinding.mode !== 'idle' && current.sellerBinding.mode !== 'auto')
       || (current.boundTab?.sellerId ?? '') !== '') return current;
@@ -392,10 +392,10 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
   const failedCandidateTabIds = new Set<number>();
   let retryFailedCandidatesAt = 0;
   while (Date.now() < deadlineAt && runId === autoBindingRunId) {
-    const bindingState = await getOrderSyncState();
+    const bindingState = await orderSyncStateStore.read();
     if (bindingState.sellerBinding.mode !== 'auto') return;
     if (bindingState.boundTab?.sellerId) {
-      await mutateOrderSyncState((current) => current.sellerBinding.mode === 'auto'
+      await orderSyncStateStore.update((current) => current.sellerBinding.mode === 'auto'
         ? {
           ...current,
           sellerBinding: { mode: 'idle', outcome: 'bound', deadlineAt: null },
@@ -441,7 +441,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
         await autoBindInitialSellerTab(candidate);
       } catch (error) {
         let recovered = false;
-        await mutateOrderSyncState((current) => {
+        await orderSyncStateStore.update((current) => {
           if (current.sellerBinding.mode !== 'auto') return current;
           recovered = true;
           return {
@@ -475,7 +475,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
       failedCandidateTabIds.add(candidateTabId);
       retryFailedCandidatesAt = Date.now() + 500;
       let clearedCandidate = false;
-      await mutateOrderSyncState((current) => {
+      await orderSyncStateStore.update((current) => {
         if (current.sellerBinding.mode !== 'auto'
           || current.boundTab?.tabId !== candidateTabId
           || current.boundTab?.sellerId) return current;
@@ -498,7 +498,7 @@ async function runAutomaticSellerBinding(runId: number, requestedDeadlineAt?: nu
   if (runId !== autoBindingRunId) return;
   let timedOut = false;
   let sellerIdCapturedAtTimeout = false;
-  await mutateOrderSyncState((current) => {
+  await orderSyncStateStore.update((current) => {
     if (current.sellerBinding.mode !== 'auto') return current;
     timedOut = true;
     const sellerCaptured = Boolean(current.boundTab?.sellerId);
@@ -547,7 +547,7 @@ async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<voi
   const tabId = candidate.id!;
   const tabUrl = candidate.url!;
   const candidateWasPinned = candidate.pinned === true;
-  await mutateOrderSyncState((current) => {
+  await orderSyncStateStore.update((current) => {
     if (current.sellerBinding.mode !== 'auto' || current.boundTab) {
       throw new Error('自动绑定状态已结束。');
     }
@@ -620,14 +620,14 @@ async function probeAndCaptureSellerIdentity(candidate: chrome.tabs.Tab): Promis
 }
 
 async function handleBoundTabRemoved(tabId: number): Promise<void> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (current.boundTab?.tabId !== tabId) return;
   const replacement = await findReplacementSellerTab(tabId);
   if (replacement?.id !== undefined && replacement.url) {
     await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_removed');
     return;
   }
-  await mutateOrderSyncState((state) => {
+  await orderSyncStateStore.update((state) => {
     if (!state.boundTab) return state;
     const { sellerId: _sellerId, ...withoutSellerId } = state.boundTab;
     return { ...state, boundTab: withoutSellerId };
@@ -644,14 +644,14 @@ async function handleBoundTabRemoved(tabId: number): Promise<void> {
 }
 
 async function handleLoginRedirect(tabId: number): Promise<void> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (current.boundTab?.tabId !== tabId) return;
   const replacement = await findReplacementSellerTab(tabId);
   if (replacement?.id !== undefined && replacement.url) {
     await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_login_redirect');
     return;
   }
-  await mutateOrderSyncState((state) => {
+  await orderSyncStateStore.update((state) => {
     if (!state.boundTab) return state;
     const { sellerId: _sellerId, ...withoutSellerId } = state.boundTab;
     return { ...state, boundTab: { ...withoutSellerId, url: `https://${new URL(state.boundTab.url).host}/account/login` } };
@@ -665,14 +665,14 @@ async function handleLoginRedirect(tabId: number): Promise<void> {
 }
 
 async function handleBoundTabPinChanged(tabId: number, pinned: boolean): Promise<void> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (current.boundTab?.tabId !== tabId) return;
   if (!pinned) await pinSellerTab(tabId, 'binding_repair');
   await ensureBoundSellerTabRefreshAlarm();
 }
 
 async function handleBoundTabNavigation(tabId: number, url: string): Promise<void> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (current.boundTab?.tabId !== tabId) return;
   if (isTikTokLoginPage(url)) {
     await handleLoginRedirect(tabId);
@@ -680,7 +680,7 @@ async function handleBoundTabNavigation(tabId: number, url: string): Promise<voi
   }
   if (isSellerCenterUrl(url)) {
     if (current.boundTab.url !== url) {
-      await mutateOrderSyncState((state) => state.boundTab?.tabId === tabId
+      await orderSyncStateStore.update((state) => state.boundTab?.tabId === tabId
         ? { ...state, boundTab: { ...state.boundTab, url } }
         : state);
     }
@@ -693,7 +693,7 @@ async function handleBoundTabNavigation(tabId: number, url: string): Promise<voi
     await autoRebindSellerTab(current.boundTab, replacement, 'bound_tab_navigation');
     return;
   }
-  await mutateOrderSyncState((state) => {
+  await orderSyncStateStore.update((state) => {
     if (state.boundTab?.tabId !== tabId) return state;
     const { sellerId: _sellerId, ...withoutSellerId } = state.boundTab;
     return { ...state, boundTab: { ...withoutSellerId, url } };
@@ -728,7 +728,7 @@ async function findReplacementSellerTab(excludedTabId?: number): Promise<chrome.
 }
 
 async function scanForReplacementSellerTab(): Promise<void> {
-  const current = await getOrderSyncState();
+  const current = await orderSyncStateStore.read();
   if (!current.settings.syncBaseUrl.trim() || !current.settings.syncToken.trim() || current.boundTab?.sellerId) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
     return;
@@ -767,7 +767,7 @@ async function autoRebindSellerTab(
 ): Promise<void> {
   const tabId = replacement.id!;
   const tabUrl = replacement.url!;
-  await mutateOrderSyncState((current) => ({
+  await orderSyncStateStore.update((current) => ({
     ...current,
     boundTab: {
       ...previousBoundTab,
@@ -826,7 +826,7 @@ async function ensureBoundAlarms(
 }
 
 async function ensureBoundSellerTabRefreshAlarm(): Promise<void> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   const tabId = state.boundTab?.tabId;
   if (tabId === undefined) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
@@ -854,7 +854,7 @@ async function ensureBoundSellerTabRefreshAlarm(): Promise<void> {
 }
 
 async function ensureSellerBindingWatchAlarm(): Promise<void> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   if (!state.settings.syncBaseUrl.trim() || !state.settings.syncToken.trim() || state.boundTab?.sellerId) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.watch);
     return;
@@ -869,7 +869,7 @@ async function ensureSellerBindingWatchAlarm(): Promise<void> {
 }
 
 async function refreshBoundSellerTab(): Promise<void> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   const boundTab = state.boundTab;
   if (!boundTab) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
@@ -955,7 +955,7 @@ async function refreshBoundSellerTab(): Promise<void> {
 }
 
 async function scheduleBoundSellerTabRefresh(delayInMinutes: number): Promise<void> {
-  const state = await getOrderSyncState();
+  const state = await orderSyncStateStore.read();
   if (!state.boundTab) {
     await chrome.alarms.clear(SELLER_TAB_ALARMS.refresh);
     return;
