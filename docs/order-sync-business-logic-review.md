@@ -4,6 +4,15 @@
 > 范围：`chrome-plugins/order-data-sync` 与 TTS ERP `/v2/order-sync/*` 接收链路  
 > 本文只做现状梳理和风险判断，不修改同步行为。
 
+### 已确认的业务规则
+
+1. 所有同步插件产生的数据都先写入 TTS ERP PostgreSQL 的 **`plugin` schema**，不由插件直接写其他业务 schema。
+2. 所有管道采用 **T-1 截止**：假设 shop local date 为 9 月 10 日，本次只能同步 9 月 10 日之前的数据。
+3. 每个 shop local day 自动执行一次逻辑同步；Popup 允许用户额外主动同步一次，手动同步也遵守同一 T-1 截止。
+4. 业务上不存在部分退款：只要确认发生退款，就按整单退款处理。
+5. 退款金额优先使用退款 response 的结构化金额；没有退款金额时，回退订单实付金额。
+6. 除退款发生事实和状态外，还要同步退货/退款物流状态。
+
 ## 1. 结论摘要
 
 插件目前不是 3 条管道，而是 **5 条已实现管道 + 1 条只有协议、没有采集 implementation 的管道**：
@@ -19,7 +28,8 @@
 
 但当前不能把它描述为“订单、物流、结算、退款都已完整同步”。主要原因：
 
-- **退款/售后没有独立采集管道**。现在只能从 `order/get.reverse_module` 和 `order/history` 间接看到部分退货退款信息，TTS ERP 的 `after_sales` / `after_sale_items` 表不会由本插件填充。
+- **退款/售后没有独立采集管道**。实际抓包已经确认结构化 endpoint 是 `POST /api/v1/reverse/component/orders/list`，退款金额字段是 `data.cards[].biz_data.return_price`；插件没有调用该 endpoint。TTS ERP 当前 `after_sales` parser 仍按假设的 `/return_refund/202309/cancellations/search` shape 解析，两端契约并不匹配。
+- **当前代码没有实现 T-1 cutoff**。订单请求使用空 `condition_list`，物流/详情/历史跟随该列表，结算也未设置日期截止；今天产生或更新的数据可能进入今天的 Sync Run。
 - **订单历史跨页存在确定的数据覆盖问题**：插件逐页上传，但服务端每页都从 `event_index=0` 写入，因此第 2 页会覆盖第 1 页相同索引的数据；而且抓包显示列表为最新在前，服务端注释却把 `0` 当作最早事件。
 - **TTS ERP 不健康时的自动恢复有断链风险**：alarm 触发后会先把 domain 标为 running，再因 health gate 跳过；此时可能既不安排 continuation，也不安排下一日 alarm。恢复回调只尝试“首次同步”，已有 `lastRunAt` 时不会真正恢复。
 - **永久失败没有从可重试队列中分离**：413、422 等不可恢复错误最终仍会进入 pending queue，并按约 6 秒 continuation 反复重试。
@@ -43,6 +53,7 @@
 | --- | --- | --- |
 | `../codex-tiktok-shop-order-product-logistics-api.md` | `order/list`、`logistic_detail/list`、`statement/list/detail`、`statement/transaction/detail` 请求和脱敏响应摘要 | 实际抓包；文档标注验证日期 2026-09-08 |
 | `docs/tiktok-fulfillment-order-apis.md` | `order/get` 和 `order/history` 的较完整脱敏 response；含 reverse、价格、买家、历史证据图片等字段 | 实际抓包；文档标注 2026-09-26 |
+| `../../tts-erp/tech-doc/tiktok-seller-center-api-catalog.md` §2.7 | `/api/v1/reverse/component/orders/list` 的 request、真实 `biz_data` 示例和退款字段说明 | 实际抓包；示例标注 2026-09-14 |
 
 其中已确认：
 
@@ -51,7 +62,10 @@
 - `order/get` 中已观察到 `reverse_module`；
 - `order/history` 中已观察到退货申请、自动批准、寄回和退款完成等事件；
 - `statement/list/detail` 能得到 `statement_id + statement_version`；
-- `statement/transaction/detail` 需要额外的 `statement_sku_detail_id`。
+- `statement/transaction/detail` 需要额外的 `statement_sku_detail_id`；
+- 退款列表每张 `cards[]` 代表一笔退款，`biz_data.main_order_id` 关联原订单，`biz_data.reverse_main_order_id` 是售后单号；
+- **实际退款金额字段已确认存在：`biz_data.return_price`**，格式类似 `"544.116₫"`；
+- 当前抓包没有确认结构化退货物流 tracking endpoint/字段。
 
 ### 2.2 没有保存的证据
 
@@ -60,8 +74,8 @@
 - `.har` 文件；
 - 可由测试直接加载的 TikTok 原始 response JSON corpus；
 - `/api/v1/pay/statement/order/list` 的独立真实抓包样本；
-- `/return_refund/202309/cancellations/search` 的真实成功 response；
-- 能证明 `order/list` 空筛选条件覆盖“店铺全部历史订单”的未脱敏时间窗口证据。
+- 退款详情及退货物流 tracking endpoint 的真实成功 response；
+- 能证明 `order/list` 空筛选条件覆盖“店铺全部历史订单”或正确排除当天数据的未脱敏时间窗口证据。
 
 `tests/` 内 response 都是手工构造的 inline fixture。它们能验证当前代码契约，但不能证明 TikTok 当前真实 payload 没有变化。
 
@@ -138,6 +152,25 @@ flowchart LR
 ---
 
 ## 5. 什么时候同步
+
+### 业务要求：T-1、每天一次、允许手动补跑
+
+每个 shop local day 只需要一个自动 Sync Run。它的统一 cutoff 是当天本地零点：
+
+```text
+record_time < start_of_today(shop_timezone)
+```
+
+例如 shop local date 为 9 月 10 日，只处理 9 月 9 日 23:59:59 及更早的数据。手动同步用于补跑或提前触发，但不能把 9 月 10 日当天数据纳入。
+
+当前实现只有“上一轮结束后延迟 24 小时”的 one-shot alarm，并没有：
+
+- shop timezone 的本地日界线；
+- T-1 请求条件；
+- “每个本地自然日最多一次自动 run”的 durable 标记；
+- 对退款/结算 update time 的统一 cutoff。
+
+因此“24 小时间隔”符合每日一次的大方向，但 **尚不符合 T-1 数据边界**，而且执行时间会随每轮完成时间漂移。建议后续改为按 shop-local 固定时刻计算下一次 alarm，并让自动与手动入口共享同一个 cutoff builder。
 
 ### 5.1 首次同步
 
@@ -267,14 +300,14 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 
 - dump domain：`logistics`；
 - `mainOrderId` 必填；
-- 服务端写 `shipments` 和 `tracking_events`；
+- 服务端写 `plugin.shipments` 和 `plugin.tracking_events`；
 - 一单多包裹由服务端 parser 支持。
 
 ### 评价
 
 **主逻辑正确。** 多包裹、混合状态、逐单失败和作用域变化都处理得较稳健。
 
-**业务时效风险：** 完整轮次默认每天一次。运输轨迹是高频可变数据，如果 ERP 需要小时级物流状态，24 小时 SLA 不够。
+**同步频率符合要求，但日期边界不符合。** 每天一次已经满足业务频率；当前物流候选仍可能包含 shop 当天订单，后续必须和 orders 共享同一个 T-1 cutoff。
 
 ## 6.3 Order details：订单完整详情
 
@@ -289,7 +322,7 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 
 - dump domain：`order_details`；
 - 插件先通过 `OrderGetResponseSchema`；
-- TTS ERP 写 `order_details`；
+- TTS ERP 写 `plugin.order_details`；
 - 原始 order object 保存在 `raw_payload`。
 
 服务端规范化字段只取：
@@ -302,7 +335,7 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 
 **作为订单快照管道基本正确。** 它确实补齐了订单列表之外的金额、买家、仓库、物流和逆向字段。
 
-**但不能代替完整售后管道：** 一个订单可能有多个 reverse record；规范化表只取第一条，其他记录只留在 raw JSON，且不会写入 `after_sales` / `after_sale_items`。
+**但不能代替完整售后管道：** 一个订单可能有多个 reverse record；规范化表只取第一条，其他记录只留在 raw JSON，且不会写入 `plugin.after_sales` / `plugin.after_sale_items`。
 
 ## 6.4 Order history：订单历史
 
@@ -368,8 +401,8 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 
 统一使用 domain `statements`：
 
-- 有 `data.sku_record` 时服务端走 transaction parser，写 `settlement_details`；
-- 否则走 statement-list parser，写 `settlements`。
+- 有 `data.sku_record` 时服务端走 transaction parser，写 `plugin.settlement_details`；
+- 否则走 statement-list parser，写 `plugin.settlements`。
 
 ### 评价
 
@@ -380,36 +413,74 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 1. 真实抓包文档没有保存中间 `/statement/order/list` 成功样本，目前 endpoint method/query/两个 variant 主要由代码和合成测试证明；
 2. response 暴露 `search_next_cursor`，生产代码仍只用 `from`。当结算列表同步期间发生插入/重排时，offset 分页可能重复或漏项；
 3. 断点只到 statement 级，不到 SKU detail 级。一个超大 statement 在 MV3 worker 中途终止后，会重做该 statement 已完成的所有 detail；
-4. 24 小时全量刷新是否满足财务时效，需要业务确认。
+4. 每天一次符合已确认的业务频率，但当前 statement 请求没有 T-1 cutoff，仍可能读取当天新增或更新的数据。
 
 ## 6.6 After sales / Refunds：售后退款
 
-### 当前实际状态
+### 已确认的业务语义
+
+- 不存在部分退款；发生退款后，业务上按整单退款处理；
+- 是否退款、退款状态、退货/退款物流状态都要保存；
+- 金额优先级：
+  1. 退款 response 的结构化退款金额；
+  2. 如果退款金额缺失或无法解析，回退订单实付金额，即 `price_module.grand_total.price_val` / `plugin.orders.payment_amount`；
+- 所有结果先写入 `plugin` schema。
+
+### 已确认的真实 Seller Center endpoint
+
+实际抓包已记录：
+
+- `POST /api/v1/reverse/component/orders/list`；
+- response：`data.cards[]`，每张 card 是一笔退款；
+- `biz_data.main_order_id`：原订单；
+- `biz_data.reverse_main_order_id`：售后单；
+- `biz_data.reverseType`：退款/逆向类型；
+- `biz_data.return_price`：实际退款金额，例如 `"544.116₫"`。
+
+因此金额策略可以确定为：
+
+```text
+refund_amount = parseMoney(biz_data.return_price)
+             ?? plugin.orders.payment_amount
+```
+
+不能优先使用 `sub_total`、原价或促销前金额；fallback 应是买家实际支付金额。
+
+### 当前插件与服务端状态
 
 插件侧：
 
 - wire enum 有 `after_sales`；
 - Popup display type 有 `after_sales`；
-- **没有生产 domain key、alarm、endpoint builder、poll dispatcher 或 queue**。
+- **没有生产 domain key、alarm、真实 endpoint builder、poll dispatcher 或 queue**。
 
 服务端：
 
 - `DumpDomain.AFTER_SALES` 已接入；
-- parser 预期 `/return_refund/202309/cancellations/search`；
-- 写 `after_sales` 和 `after_sale_items`；
-- parser 文档明确说 payload 是按业务规则假设设计，Chrome 尚未抓到真实成功数据。
+- 数据表在 `plugin.after_sales` 与 `plugin.after_sale_items`；
+- 当前 parser 预期的是假设 shape：`/return_refund/202309/cancellations/search -> data.cancellations[].cancel_line_items[].refund_amount.amount`；
+- 该 shape 与已抓到的 `reverse/component/orders/list -> data.cards[].biz_data.return_price` 不一致。
+
+### 状态和退货物流
+
+现有证据能提供：
+
+- `order/get.reverse_module.reverse_status/reverse_type`；
+- `order/history` 的申请、批准、寄回、退款完成时间线；
+- 退款列表中的 `reverseType` 和本地化 card 内容。
+
+但尚未确认一个稳定的结构化退货物流 tracking endpoint，也未确认退款列表是否存在独立结构化 status 字段。不能把本地化文案当成长期 status contract。
+
+建议 implementation：
+
+1. 退款列表负责“发生退款、售后单 ID、实际退款金额”；
+2. `order/get.reverse_module` 或后续抓到的退款详情负责结构化状态；
+3. 单独抓取退货物流页面，确认 tracking number、carrier、status、event time 后再设计 `plugin` schema 字段；
+4. 如果退款金额不存在，服务端 intake 在同一 `plugin` schema 内按 `main_order_id` 回退 `plugin.orders.payment_amount`，避免由浏览器插件拼接数据库事实。
 
 ### 评价
 
-**业务目标未完成。**
-
-当前能获得的退款信息只有：
-
-- `order/get.reverse_module` 的部分逆向字段；
-- `order/history` 的自然语言时间线和证据；
-- statement detail 中可能出现的财务调整。
-
-这些信息不能稳定替代结构化的退款/退货实体，尤其缺少多行项目、退款金额、售后状态生命周期和一单多售后单关系。
+**业务目标尚未完成，但退款金额来源已经确认，不再是未知项。** 当前首要工作是把真实 endpoint/shape 固化为 golden response，并重画插件 `after_sales` dump 与服务端 parser 的 seam。
 
 ---
 
@@ -473,7 +544,9 @@ Chrome local storage 保存：
 | `logistics` 要求 mainOrderId | 对齐 |
 | `order_details` / `order_history` schema | 对齐；history 分页 index 语义不对齐 |
 | `statements` list/detail 通过 payload shape 分流 | 对齐 |
-| `after_sales` | 服务端已准备，插件未生产 |
+| `after_sales` | 插件未生产；服务端 parser 使用假设 shape，与已抓到的真实 `cards[].biz_data.return_price` 不一致 |
+| persistence boundary | 六域 intake 均写 `plugin` schema；这是所有插件同步数据的固定边界 |
+| T-1 cutoff | 未对齐：当前五条生产管道都没有统一 shop-local cutoff |
 | sellerId / shopId | 两端测试均使用同一个 Seller 店铺 ID |
 | reconciliation | 仅 orders/logistics；两端 schema 对齐 |
 | 幂等 | 服务端自然键 upsert；插件允许安全重放多数 dump |
@@ -486,11 +559,12 @@ Chrome local storage 保存：
 | 优先级 | 问题 | 业务影响 | 建议 |
 | --- | --- | --- | --- |
 | P0 | order history 多页都从 event_index=0 upsert | 历史页互相覆盖；退款/取消时间线丢失 | 建立带 offset 或稳定 event key 的跨仓库契约测试并修复 |
-| P0/P1 | 没有 after_sales 采集管道 | 退款数据不完整，服务端售后表为空 | 先抓真实成功 response，再定义 endpoint schema、分页和增量规则 |
+| P0/P1 | 没有 after_sales 采集管道，且服务端 parser 与真实退款列表 shape 不一致 | 退款事实、金额、状态和退货物流不能按 contract 写入 `plugin` schema | 以已抓到的 `reverse/component/orders/list` 为起点建立 golden fixture 和双端 schema；继续抓退款详情/退货物流 |
 | P1 | health gate 跳过后可能不再安排 alarm；恢复回调只走首次同步 | 服务恢复后 domain 可能永久卡在 running，直到页面事件或人工干预 | gate 前不要 begin run；或 skipped 时明确安排 continuation；恢复时触发 resume 而不是 initial-only |
 | P1 | permanent upload error 仍进入 continuation queue | 413/422 数据会无限重试并制造日志/请求风暴 | queue 按 retryable/permanent/needs-human 分类 |
-| P1 | order/list 没有显式历史时间范围 | 可能只同步 Seller Center 默认窗口，无法证明历史完整性 | 确认 `default_search_create_time`，明确开店日起始和时间窗分页策略 |
-| P1/P2 | 全部可变 domain 正常间隔都是 24h | 物流和退款状态可能延迟一天 | 先定义业务 SLA，再按 domain 使用不同周期 |
+| P1 | 五条生产管道没有统一 T-1 cutoff | 今天的数据可能提前进入 plugin schema，不符合已确认业务规则 | 建立 shop-local cutoff builder，所有自动/手动入口与 endpoint filter 共用 |
+| P1 | order/list 没有显式历史时间范围 | 可能只同步 Seller Center 默认窗口，也无法证明 T-1 完整覆盖 | 确认 `default_search_create_time`，明确首次回填窗口和每日 T-1 增量窗口 |
+| P1/P2 | alarm 是“完成后 +24h”，不是 shop-local 每日计划 | 长任务和失败会让执行时间漂移，难以证明每个自然日恰有一次自动 run | 按 shop timezone 计算每日固定 alarm；continuation 仍属于同一逻辑 run |
 | P2 | statement/order/list 无真实 fixture，statement list 忽略 cursor | TikTok 合约漂移或列表变动时可能漏/重 | 补抓包；优先按 cursor 前进并加非前进保护 |
 | P2 | statement/history 子步骤没有细粒度断点 | 大 statement 或长历史在 MV3 重启后反复重做 | 保存 detail/page cursor，或拆成独立 durable unit |
 | P2 | 详情表只规范化第一条 reverse/delivery/status | 多售后、多包裹信息只能在 raw 中查询 | 售后独立建模；多包裹继续以 logistics 为准 |
@@ -500,30 +574,36 @@ Chrome local storage 保存：
 
 ---
 
-## 10. 建议的讨论顺序
+## 10. 已确认决策与剩余讨论项
 
-建议先确认业务契约，再改代码：
+### 已确认
 
-1. **退款的权威 source 是什么？**
-   - 独立 cancellation/return/refund endpoint；
-   - 还是 order detail/history 足够；
-   - 退款金额和行项目以哪个 response 为准？
-2. **订单历史是否需要完整时间线？**
-   - 如果需要，P0 跨页覆盖必须先修；
-   - event index 应按最新→最旧还是最旧→最新？
-3. **数据时效 SLA 是多少？**
-   - 订单、物流、退款、结算分别允许延迟多久；
-   - 是否接受统一每天一次？
-4. **历史覆盖范围是什么？**
-   - 仅 Seller Center 默认窗口；
-   - 最近 N 天；
-   - 从店铺开店日开始全部回填。
-5. **不可解析数据怎么处理？**
-   - 永久失败进入 needs-human/dead-letter；
-   - 还是无限自动重试。
-6. **是否允许保存脱敏 golden response？**
-   - 建议至少为六个 domain 各保存一个成功样本、一个空样本、一个结构异常样本；
-   - 增加 plugin dump → TTS ERP parser 的跨仓库测试。
+1. 所有插件同步数据先写 `plugin` schema；
+2. 自动同步每天一次；Popup 允许手动同步；
+3. 自动与手动同步都只处理 T-1 及更早数据；
+4. 不存在部分退款，退款发生后按整单退款；
+5. `return_price` 存在时使用实际退款金额，否则回退订单实付金额。
+
+### 仍需讨论/抓包
+
+1. **shop-local 每日 cutoff 的 timezone 来源**
+   - 从 shop region 映射；
+   - 或由 TTS ERP channel account 明确返回 timezone。
+2. **首次安装的历史回填范围**
+   - 从开店日；
+   - 或固定最近 N 天；
+   - 此后统一按 T-1 增量刷新。
+3. **退款结构化状态和退货物流 source**
+   - 需要继续在退款详情/退货物流页面抓包；
+   - 禁止长期依赖本地化 card 文案推断状态。
+4. **订单历史 event index 方向**
+   - 必须修复跨页覆盖；
+   - 决定 0 表示最新还是最早。
+5. **不可解析数据怎么处理**
+   - 建议 permanent failure 进入 needs-human/dead-letter，不无限 continuation。
+6. **golden response corpus**
+   - 建议为六个 domain 各保存成功、空、结构异常样本；
+   - 增加 plugin dump → TTS ERP plugin schema 的跨仓库测试。
 
 ---
 
