@@ -33,4 +33,4 @@ Every datum produced by a synchronization plugin is first persisted by TTS ERP u
 Every automatic or user-triggered Sync Run may synchronize only records strictly before the current shop-local calendar day. One logical automatic run is scheduled per shop-local day; the Popup may request an additional manual run with the same cutoff.
 
 **Refund semantics**:
-The business treats an order as fully refunded once a refund exists; partial refunds are out of scope. Use the structured refund amount when the Shop response provides one. Otherwise fall back to the order's paid amount. Refund status and return-logistics state remain separate facts and must also be synchronized when available.
+A refund record does not by itself prove that the entire order was refunded. Use the structured refund amount whenever the Shop response provides one. When no amount is provided, preserve the amount as unknown until an explicit fallback rule is agreed. Refund status and return-logistics state remain separate facts and must also be synchronized when available.

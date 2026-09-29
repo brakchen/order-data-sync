@@ -9,8 +9,8 @@
 1. 所有同步插件产生的数据都先写入 TTS ERP PostgreSQL 的 **`plugin` schema**，不由插件直接写其他业务 schema。
 2. 所有管道采用 **T-1 截止**：假设 shop local date 为 9 月 10 日，本次只能同步 9 月 10 日之前的数据。
 3. 每个 shop local day 自动执行一次逻辑同步；Popup 允许用户额外主动同步一次，手动同步也遵守同一 T-1 截止。
-4. 业务上不存在部分退款：只要确认发生退款，就按整单退款处理。
-5. 退款金额优先使用退款 response 的结构化金额；没有退款金额时，回退订单实付金额。
+4. 退款记录不代表必然整单退款，不能从“发生退款”推导退款比例。
+5. 退款 response 提供结构化退款金额时，以该退款金额为准；未提供金额时的 fallback 规则尚未确认。
 6. 除退款发生事实和状态外，还要同步退货/退款物流状态。
 
 ## 1. 结论摘要
@@ -419,11 +419,10 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 
 ### 已确认的业务语义
 
-- 不存在部分退款；发生退款后，业务上按整单退款处理；
+- 退款记录不代表必然整单退款，不能从“发生退款”推导退款比例；
 - 是否退款、退款状态、退货/退款物流状态都要保存；
-- 金额优先级：
-  1. 退款 response 的结构化退款金额；
-  2. 如果退款金额缺失或无法解析，回退订单实付金额，即 `price_module.grand_total.price_val` / `plugin.orders.payment_amount`；
+- 退款 response 提供结构化退款金额时，以该金额为准；
+- response 没有金额时如何处理尚未确认，当前不能自动回退整单实付金额；
 - 所有结果先写入 `plugin` schema。
 
 ### 已确认的真实 Seller Center endpoint
@@ -437,14 +436,16 @@ TTS ERP reconcile 也会返回 terminal logistics item，减少无意义刷新�
 - `biz_data.reverseType`：退款/逆向类型；
 - `biz_data.return_price`：实际退款金额，例如 `"544.116₫"`。
 
-因此金额策略可以确定为：
+因此当前已确认的金额策略只有：
 
 ```text
-refund_amount = parseMoney(biz_data.return_price)
-             ?? plugin.orders.payment_amount
+if biz_data.return_price is present:
+    refund_amount = parseMoney(biz_data.return_price)
+else:
+    refund_amount = unknown  # 等待明确 fallback 规则
 ```
 
-不能优先使用 `sub_total`、原价或促销前金额；fallback 应是买家实际支付金额。
+不能因为存在退款记录就默认使用整单 `grand_total`、`sub_total`、原价或促销前金额。
 
 ### 当前插件与服务端状态
 
@@ -460,7 +461,7 @@ refund_amount = parseMoney(biz_data.return_price)
 - 数据表在 `plugin.after_sales` 与 `plugin.after_sale_items`；
 - 当前只有 `plugin.after_sale_items.refund_amount/currency`，`plugin.after_sales` 没有订单级退款金额列；
 - 当前 parser 预期的是假设 shape：`/return_refund/202309/cancellations/search -> data.cancellations[].cancel_line_items[].refund_amount.amount`；
-- 真实 `return_price` 是退款 card/售后单级金额，而不是已确认的 line-item 金额。结合“不存在部分退款”的业务规则，当前落库粒度也不匹配：应优先在 `plugin.after_sales` 保存订单级 `refund_amount/currency`，而不是强行构造虚假的行级拆分；
+- 真实 `return_price` 是退款 card/售后单级金额，而不是已确认的 line-item 金额。当前落库粒度仍不匹配：应在 `plugin.after_sales` 保存 card/售后单级 `refund_amount/currency`；只有真实 response 提供行级金额时，才写 `plugin.after_sale_items.refund_amount`，不能虚构行级拆分；
 - 该 shape 与已抓到的 `reverse/component/orders/list -> data.cards[].biz_data.return_price` 不一致。
 
 ### 状态和退货物流
@@ -478,7 +479,7 @@ refund_amount = parseMoney(biz_data.return_price)
 1. 退款列表负责“发生退款、售后单 ID、实际退款金额”；
 2. `order/get.reverse_module` 或后续抓到的退款详情负责结构化状态；
 3. 单独抓取退货物流页面，确认 tracking number、carrier、status、event time 后再设计 `plugin` schema 字段；
-4. 如果退款金额不存在，服务端 intake 在同一 `plugin` schema 内按 `main_order_id` 回退 `plugin.orders.payment_amount`，避免由浏览器插件拼接数据库事实。
+4. 如果退款金额不存在，先以 `null/unknown` 落在 `plugin` schema；在 fallback 规则明确前，不自动套用整单金额。
 
 ### 评价
 
@@ -561,7 +562,7 @@ Chrome local storage 保存：
 | 优先级 | 问题 | 业务影响 | 建议 |
 | --- | --- | --- | --- |
 | P0 | order history 多页都从 event_index=0 upsert | 历史页互相覆盖；退款/取消时间线丢失 | 建立带 offset 或稳定 event key 的跨仓库契约测试并修复 |
-| P0/P1 | 没有 after_sales 采集管道；parser shape 和退款金额落库粒度都与真实 response 不一致 | `return_price` 是订单/售后单级，但当前只有 `plugin.after_sale_items.refund_amount`；退款事实、金额、状态和退货物流无法正确落库 | 以真实 `reverse/component/orders/list` 建立双端 schema；在 `plugin.after_sales` 增加订单级退款金额/币种，再继续抓退款详情/退货物流 |
+| P0/P1 | 没有 after_sales 采集管道；parser shape 和退款金额落库粒度都与真实 response 不一致 | `return_price` 是 card/售后单级，但当前只有 `plugin.after_sale_items.refund_amount`；退款事实、金额、状态和退货物流无法正确落库 | 以真实 `reverse/component/orders/list` 建立双端 schema；在 `plugin.after_sales` 增加售后单级退款金额/币种，仅在真实行级金额存在时写 item，再继续抓退款详情/退货物流 |
 | P1 | health gate 跳过后可能不再安排 alarm；恢复回调只走首次同步 | 服务恢复后 domain 可能永久卡在 running，直到页面事件或人工干预 | gate 前不要 begin run；或 skipped 时明确安排 continuation；恢复时触发 resume 而不是 initial-only |
 | P1 | permanent upload error 仍进入 continuation queue | 413/422 数据会无限重试并制造日志/请求风暴 | queue 按 retryable/permanent/needs-human 分类 |
 | P1 | 五条生产管道没有统一 T-1 cutoff | 今天的数据可能提前进入 plugin schema，不符合已确认业务规则 | 建立 shop-local cutoff builder，所有自动/手动入口与 endpoint filter 共用 |
@@ -583,8 +584,8 @@ Chrome local storage 保存：
 1. 所有插件同步数据先写 `plugin` schema；
 2. 自动同步每天一次；Popup 允许手动同步；
 3. 自动与手动同步都只处理 T-1 及更早数据；
-4. 不存在部分退款，退款发生后按整单退款；
-5. `return_price` 存在时使用实际退款金额，否则回退订单实付金额。
+4. 退款记录不能直接解释为整单退款；
+5. `return_price` 存在时使用该退款金额；缺失时暂记 unknown，fallback 规则待确认。
 
 ### 仍需讨论/抓包
 
