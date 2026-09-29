@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createDefaultOrderSettings } from '../../src/core/settings';
 import type { OrderExtensionMessage } from '../../src/extension/messages';
@@ -197,7 +197,8 @@ function Popup() {
               <em>{DOMAIN_DESCRIPTIONS[domain]}</em>
               <small>{domain === 'orders' ? `订单数 ${orderTotal(row)} · ` : ''}已上传 {row?.uploaded ?? 0} · 待处理 {row?.pending ?? 0} · 失败 {row?.failed ?? 0}</small>
               {row?.lastError ? <small className="error">{row.lastError}</small> : null}
-              {row?.syncRunStatus === 'running' && Date.now() - Date.parse(row.lastProgressAt ?? '') > 2 * 60_000
+              {domain !== 'after_sales' && row?.syncRunStatus === 'running'
+                && Date.now() - Date.parse(row.lastProgressAt ?? '') > 2 * 60_000
                 ? <button className="stop-button" disabled={busy} onClick={() => void run(
                   () => send<OrderSyncState>({ type: 'order-sync:stop-stuck-domain', domain }),
                   `${DOMAIN_LABELS[domain]}任务已停止并从断点重试。`,
