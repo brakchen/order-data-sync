@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OrderSyncState, OrderListCheckpoint } from '../src/core/types';
 import { OrderSyncError } from '../src/core/order-sync';
 import { createDefaultOrderProgress } from '../src/extension/storage';
+import { resetHealthState, stopHealthPolling } from '../src/core/tts-erp-health';
 
 const mocks = vi.hoisted(() => ({
   getState: vi.fn(),
@@ -178,6 +179,8 @@ function chromeHarness(): void {
 }
 
 beforeEach(() => {
+  stopHealthPolling();
+  resetHealthState();
   vi.useFakeTimers();
   vi.clearAllMocks();
   requested = [];
@@ -191,10 +194,10 @@ beforeEach(() => {
   mocks.uploadDump.mockResolvedValue({ requestId: 'req-1' });
 });
 afterEach(async () => {
-  // handleOrderSyncAlarm intentionally returns after the order-list producer;
-  // its logistics/detail/history consumers keep draining independently. Let
-  // those consumers finish before the next test resets fetch/state mocks.
+  // Drain any scheduled per-item delays before resetting shared module state.
   await vi.advanceTimersByTimeAsync(120_000);
+  stopHealthPolling();
+  resetHealthState();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -205,6 +208,28 @@ describe('订单域 alarm 注册规则', () => {
     await ensureLogisticsSyncAlarm();
     expect(alarms.get('order-data-sync:orders')?.delayInMinutes).toBe(1440);
     expect(alarms.get('order-data-sync:logistics')?.delayInMinutes).toBe(1440);
+  });
+
+  it('服务 worker 重启后会立即恢复仅标记 running 的订单轮次', async () => {
+    state = {
+      ...state,
+      orderProgress: {
+        ...state.orderProgress,
+        domains: {
+          ...state.orderProgress.domains,
+          orders: {
+            ...state.orderProgress.domains.orders,
+            syncRunId: 'run-before-suspend',
+            syncRunStatus: 'running',
+            listPhase: 'list_fetching',
+          },
+        },
+      },
+    };
+
+    await ensureOrderSyncAlarm();
+
+    expect(alarms.get('order-data-sync:orders')?.delayInMinutes).toBe(0.1);
   });
 
   it('未绑定店铺时清除，不空转', async () => {
@@ -579,7 +604,7 @@ describe('订单域（无 N+1）', () => {
     }));
 
     const running = handleOrderSyncAlarm();
-    await vi.advanceTimersByTimeAsync(12_000);
+    await vi.runAllTimersAsync();
     await running;
 
     // has-data 已移除，所有订单全量上传
@@ -651,7 +676,7 @@ describe('订单域（无 N+1）', () => {
     }));
 
     const running = handleOrderSyncAlarm();
-    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.runAllTimersAsync();
     await running;
 
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
@@ -758,7 +783,9 @@ describe('订单域（无 N+1）', () => {
       },
     }), { status: 200, headers: { 'content-type': 'application/json' } })));
 
-    await handleOrderSyncAlarm();
+    const running = handleOrderSyncAlarm();
+    await vi.runAllTimersAsync();
+    await running;
 
     // has-data 已移除，所有订单全量上传
     expect(uploadsForDomain('orders').map((call) => (call[2] as { mainOrderId: string }).mainOrderId))
@@ -1624,6 +1651,55 @@ describe('订单详情与历史域（N+1，逐单接口）', () => {
     expect(requestedMethods).toEqual(['POST', 'POST']);
   });
 
+  it.each([
+    {
+      domain: 'order_details' as const,
+      endpoint: '/api/fulfillment/order/get',
+      response: { code: 0, message: 'success', data: { main_order: [{ main_order_id: 'cancelled' }] } },
+    },
+    {
+      domain: 'order_history' as const,
+      endpoint: '/api/v1/fulfillment/order/history',
+      response: { code: 0, message: 'success', data: { total_count: 0, order_history: [] } },
+    },
+  ])('$domain 仍同步 main_order_status=104 的取消订单', async ({ domain, endpoint, response }) => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      requested.push(url);
+      requestedMethods.push(init?.method ?? 'GET');
+      if (url.includes('/api/fulfillment/order/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: {
+            main_orders: [{
+              main_order_id: 'cancelled',
+              order_status_module: [{ main_order_status: 104 }],
+            }],
+            has_more: false,
+            total_count: 1,
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }));
+
+    await pollOrderDomain(domain);
+
+    expect(requested.some((url) => url.includes(endpoint))).toBe(true);
+    expect(mocks.uploadDump).toHaveBeenCalledOnce();
+    expect((mocks.uploadDump.mock.calls[0]![2] as { mainOrderId: string }).mainOrderId)
+      .toBe('cancelled');
+    expect(state.orderProgress?.domains[domain]).toMatchObject({
+      uploaded: 1,
+      pending: 0,
+      failed: 0,
+    });
+  });
+
   it('dumps 失败不停止当前批次，并把订单放入续传队列', async () => {
     stubFetch(['o1', 'o2']);
     mocks.uploadDump
@@ -1719,6 +1795,46 @@ describe('订单详情与历史域（N+1，逐单接口）', () => {
     expect((mocks.uploadDump.mock.calls[0]![2] as { endpoint: string }).endpoint)
       .toContain('/api/v1/fulfillment/order/history');
   });
+
+  it('order/history 根据 total_count 读取并上传全部分页', async () => {
+    const historyBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.includes('/api/fulfillment/order/list')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: { main_orders: [{ main_order_id: 'o1' }], has_more: false, total_count: 1 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      historyBodies.push(body);
+      const offset = Number(body.offset);
+      const count = offset === 0 ? 10 : 1;
+      return new Response(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data: {
+          total_count: 11,
+          order_history: Array.from({ length: count }, (_, index) => ({
+            description: `event-${offset + index}`,
+            trans_time: String(offset + index),
+            timestamp: offset + index,
+          })),
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await pollOrderDomain('order_history');
+
+    expect(historyBodies.map((body) => body.offset)).toEqual([0, 10]);
+    expect(historyBodies.every((body) => body.page_size === 10)).toBe(true);
+    expect(mocks.uploadDump).toHaveBeenCalledTimes(2);
+    expect(mocks.uploadDump.mock.calls.map((call) => (
+      (call[2] as { request: { body: { offset: number } } }).request.body.offset
+    ))).toEqual([0, 10]);
+  });
 });
 
 describe('结算域（全局列表）', () => {
@@ -1744,15 +1860,19 @@ describe('结算域（全局列表）', () => {
       statement_id: `st-${index}`,
       statement_version: 1,
     }));
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      code: 0,
-      message: '',
-      data: {
-        total_record: records.length,
-        search_next_has_more: false,
-        statement_records: records,
-      },
-    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => new Response(JSON.stringify(
+      String(input).includes('/api/v1/pay/statement/order/list')
+        ? { code: 0, message: '', data: { total_record: 0, search_next_has_more: false, order_records: [] } }
+        : {
+            code: 0,
+            message: '',
+            data: {
+              total_record: records.length,
+              search_next_has_more: false,
+              statement_records: records,
+            },
+          },
+    ), { status: 200, headers: { 'content-type': 'application/json' } })));
 
     for (let round = 0; round < 11; round += 1) await pollOrderDomain('statements');
 
@@ -1831,24 +1951,77 @@ describe('结算域（全局列表）', () => {
       .toEqual(['st-1', 'st-2']);
   });
 
-  it('列表记录带 SKU 明细 ID 时继续抓 transaction/detail 并上传明细', async () => {
+  it('通过 statement/order/list 发现全部 SKU 明细 ID 并逐条上传', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
       const url = String(input);
       requested.push(url);
       if (url.includes('/api/v1/pay/statement/transaction/detail')) {
-        expect(url).toContain('https://api16-normal-sg.tiktokshopglobalselling.com/');
+        const detailId = new URL(url).searchParams.get('statement_sku_detail_id')!;
         return new Response(JSON.stringify({
           code: 0,
           message: 'success',
           data: {
             sku_record: {
-              statement_sku_detail_id: 'sku-detail-1',
+              statement_sku_detail_id: detailId,
               statement_id: 'st-1',
               statement_version: 1,
-              sku_id: 'sku-1',
+              sku_id: `sku-${detailId}`,
             },
           },
         }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.includes('/api/v1/pay/statement/order/list')) {
+        const settled = new URL(url).searchParams.get('settlement_status') === '1';
+        return new Response(JSON.stringify({
+          code: 0,
+          message: 'success',
+          data: {
+            total_record: settled ? 1 : 0,
+            search_next_has_more: false,
+            order_records: settled ? [{
+              statement_id: 'st-1',
+              statement_version: 1,
+              sku_records: [
+                { statement_sku_detail_id: 'sku-detail-1' },
+                { statement_sku_detail_id: 'sku-detail-2' },
+              ],
+            }] : [],
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data: {
+          total_record: 1,
+          search_next_has_more: false,
+          statement_records: [{ statement_id: 'st-1', statement_version: 1 }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await pollOrderDomain('statements');
+
+    const orderListRequests = requested.filter((url) => url.includes('/api/v1/pay/statement/order/list'));
+    const detailRequests = requested.filter((url) => url.includes('/api/v1/pay/statement/transaction/detail'));
+    expect(orderListRequests).toHaveLength(2);
+    expect(orderListRequests.every((url) => url.includes('no_need_sku_record=false'))).toBe(true);
+    expect(detailRequests.map((url) => new URL(url).searchParams.get('statement_sku_detail_id')))
+      .toEqual(['sku-detail-1', 'sku-detail-2']);
+    expect(mocks.uploadDump).toHaveBeenCalledTimes(3);
+    expect(mocks.uploadDump.mock.calls.slice(1).every((call) => (
+      (call[2] as { endpoint: string }).endpoint.includes('/api/v1/pay/statement/transaction/detail')
+    ))).toBe(true);
+  });
+
+  it('结算明细结构无效时不上传并保留 statement 重试', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('/api/v1/pay/statement/transaction/detail')) {
+        return new Response(JSON.stringify({ code: 0, message: 'success', data: {} }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       }
       return new Response(JSON.stringify({
         code: 0,
@@ -1867,12 +2040,13 @@ describe('结算域（全局列表）', () => {
 
     await pollOrderDomain('statements');
 
-    expect(requested.some((url) => url.includes('/api/v1/pay/statement/transaction/detail'))).toBe(true);
-    expect(mocks.uploadDump).toHaveBeenCalledTimes(2);
-    expect(mocks.uploadDump.mock.calls[1]![2]).toMatchObject({
-      domain: 'statements',
-      endpoint: expect.stringContaining('/api/v1/pay/statement/transaction/detail'),
+    expect(mocks.uploadDump).toHaveBeenCalledOnce();
+    expect(state.orderProgress.domains.statements).toMatchObject({
+      pending: 1,
+      failed: 1,
+      failedOrderIds: ['st-1::1'],
     });
+    expect(state.orderProgress.domains.statements.lastError).toContain('schema 校验失败');
   });
 
   it('结算主记录上传后作用域失效时，不再请求或上传明细', async () => {
@@ -1912,15 +2086,19 @@ describe('结算域（全局列表）', () => {
       statement_id: `st-${index + 1}`,
       statement_version: 1,
     }));
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      code: 0,
-      message: '',
-      data: {
-        total_record: records.length,
-        search_next_has_more: false,
-        statement_records: records,
-      },
-    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    vi.stubGlobal('fetch', vi.fn(async (input: unknown) => new Response(JSON.stringify(
+      String(input).includes('/api/v1/pay/statement/order/list')
+        ? { code: 0, message: '', data: { total_record: 0, search_next_has_more: false, order_records: [] } }
+        : {
+            code: 0,
+            message: '',
+            data: {
+              total_record: records.length,
+              search_next_has_more: false,
+              statement_records: records,
+            },
+          },
+    ), { status: 200, headers: { 'content-type': 'application/json' } })));
 
     await pollOrderDomain('statements');
 

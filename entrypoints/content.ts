@@ -11,6 +11,8 @@ import {
   ORDER_IDENTITY_SOURCE,
 } from '../src/extension/page-request-protocol';
 
+const PAGE_PROXY_TIMEOUT_MARGIN_MS = 1_000;
+
 export default defineContentScript({
   matches: [
     'https://seller.tiktokglobalshop.com/*',
@@ -56,8 +58,17 @@ export default defineContentScript({
       };
       const timeout = setTimeout(() => {
         cleanup(listener, timeout);
-        sendResponse({ ok: false, errorName: 'PageProxyTimeoutError', errorMessage: '订单请求超过 30 秒未响应。' });
-      }, 30_000);
+        window.postMessage({
+          source: ORDER_PAGE_PROXY_SOURCE,
+          type: ORDER_PAGE_PROXY_CANCEL,
+          payload: { requestId: request.requestId },
+        }, '*');
+        sendResponse({
+          ok: false,
+          errorName: 'PageProxyTimeoutError',
+          errorMessage: `订单页面代理在 ${request.timeoutMs + PAGE_PROXY_TIMEOUT_MARGIN_MS} 毫秒内未响应。`,
+        });
+      }, request.timeoutMs + PAGE_PROXY_TIMEOUT_MARGIN_MS);
       window.addEventListener('message', listener);
       window.postMessage({ source: ORDER_PAGE_PROXY_SOURCE, type: ORDER_PAGE_PROXY_REQUEST, payload: request }, '*');
       return true;

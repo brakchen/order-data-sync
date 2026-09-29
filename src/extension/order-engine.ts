@@ -18,11 +18,18 @@ import { OrderGetResponseSchema, OrderHistoryResponseSchema } from '../core/tikt
 import { isCancelledTikTokOrderRow } from '../core/tiktok-order-status';
 import {
   createStatementListQuery,
+  createStatementOrderListQuery,
   createStatementTransactionDetailQuery,
   TIKTOK_STATEMENT_API_ORIGIN,
   tiktokStatementEndpointUrl,
 } from '../core/tiktok-statement-endpoints';
-import { StatementListResponseSchema } from '../core/tiktok-statement-endpoint-schemas';
+import {
+  extractStatementSkuDetailRefs,
+  StatementListResponseSchema,
+  StatementOrderListResponseSchema,
+  StatementTransactionDetailResponseSchema,
+  type StatementSkuDetailRef,
+} from '../core/tiktok-statement-endpoint-schemas';
 import { createAdaptivePageLoadGuard } from '../core/adaptive-page-load-guard';
 import { createRequestRateLimiter } from '../core/request-rate-limiter';
 import { normalizeOrderSyncBaseUrl } from '../core/settings';
@@ -33,6 +40,7 @@ import {
   resetHealthState,
   startHealthPolling,
   stopHealthPolling,
+  type TtsErpHealthState,
 } from '../core/tts-erp-health';
 import type {
   OrderBoundTab,
@@ -276,6 +284,10 @@ const ORDER_DOMAIN_BATCH_SIZE = 50;
 /** 每轮订单列表拉取条数。 */
 const ORDER_LIST_PAGE_SIZE = 20;
 
+const ORDER_HISTORY_PAGE_SIZE = 10;
+
+const MAX_ORDER_HISTORY_PAGES = 500;
+
 const STATEMENT_LIST_PAGE_SIZE = 50;
 
 const MAX_ORDER_LIST_PAGES = 500;
@@ -492,7 +504,8 @@ export function resetTikTokEndpointCircuit(): void {
  */
 export function orderShopRegion(state: OrderSyncState): string | null {
   const sellerId = state.boundTab?.sellerId;
-  const cached = state.shopRegion?.sellerId === sellerId ? state.shopRegion.region.trim() : '';
+  const shopRegion = state.shopRegion;
+  const cached = shopRegion && shopRegion.sellerId === sellerId ? shopRegion.region.trim() : '';
   const captured = state.boundTab?.shopRegion?.trim() ?? '';
   return cached || captured || null;
 }
@@ -751,6 +764,13 @@ type OrderListFetchOptions = {
   maxRows?: number;
   /** When present, process each page immediately instead of waiting for the full list. */
   onPage?: (page: OrderListPage) => Promise<void>;
+};
+
+
+type OrderPagePipeline = {
+  onPage: (page: OrderListPage) => Promise<void>;
+  /** Own every in-memory consumer until its durable batch checkpoint is written. */
+  drain: () => Promise<void>;
 };
 
 
@@ -2103,8 +2123,9 @@ async function processOrderDetailsBatch(
   options: LogisticsBatchOptions = {},
 ): Promise<void> {
   const previous = state.orderProgress?.domains.order_details ?? createDefaultOrderProgress().domains.order_details;
-  const activeRows = rows.filter((entry) => !isCancelledTikTokOrderRow(entry.row));
-  const cancelledSkipped = rows.length - activeRows.length;
+  // Cancellation is terminal only for logistics. Details remain mutable and
+  // contain refund/buyer/amount fields that still need to reach the ERP.
+  const activeRows = rows;
   const pendingKeys = pendingOrderDomainKeys(previous, activeRows.map((entry) => ({ key: entry.orderId })));
   const entryById = new Map(activeRows.map((entry) => [entry.orderId, entry]));
   const preservedFailedIds = new Set(options.preservedFailedOrderIds ?? []);
@@ -2113,7 +2134,7 @@ async function processOrderDetailsBatch(
     ...preservedFailedIds,
   ]);
   let lastError = previous.lastError;
-  const terminalCount = Math.max(0, terminalSkipped) + cancelledSkipped;
+  const terminalCount = Math.max(0, terminalSkipped);
   const roundTotal = activeRows.length + terminalCount;
   const progressTotal = Math.max(roundTotal, options.total ?? roundTotal);
   const uploadedBefore = Math.max(0, options.uploadedBefore ?? 0);
@@ -2438,6 +2459,189 @@ async function processOrderDetailsBatch(
 }
 
 
+async function syncOrderHistoryPages(
+  state: OrderSyncState,
+  settings: OrderApiSettings,
+  scope: OrderSyncScope,
+  boundTab: NonNullable<OrderSyncState['boundTab']>,
+  origin: string,
+  orderId: string,
+): Promise<void> {
+  const historyUrl = tiktokOrderHistoryEndpointUrl(origin, boundTab.sellerId!);
+  let offset = 0;
+
+  for (let pageIndex = 0; pageIndex < MAX_ORDER_HISTORY_PAGES; pageIndex += 1) {
+    if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
+      throw new StopOrderDomainBatch('订单历史分页请求前同步作用域已变化。');
+    }
+    const historyBody = createOrderHistoryRequestBody(orderId, offset, ORDER_HISTORY_PAGE_SIZE);
+    const requestStartedAt = Date.now();
+    let detail: BoundTikTokResponse;
+    try {
+      detail = await executeTikTokRequestWithTimeout(
+        boundTab.tabId, historyUrl, historyBody, 'POST', ORDER_ITEM_REQUEST_TIMEOUT_MS,
+      );
+    } catch (error) {
+      await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史请求异常。', {
+        stage: 'order_history',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody),
+        ...orderRequestExceptionDetails(error),
+      });
+      throw error;
+    }
+    const detailPayload = isRecord(detail.payload) ? detail.payload : null;
+    if (!detail.ok) {
+      await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应失败。', {
+        stage: 'order_history',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
+        ...orderTikTokResponseDiagnostics(detail),
+      });
+      if (isTikTokAuthenticationFailure(detail)) {
+        await clearOrderBinding(state, 'order_history_authentication_failed');
+        throw new StopOrderDomainBatch('订单历史请求需要重新登录。');
+      }
+      throw new Error(orderTikTokFailureSummary('订单历史请求失败', detail));
+    }
+    if (isTikTokAuthenticationFailure(detail)) {
+      await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应要求重新登录。', {
+        stage: 'order_history',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        failureReason: 'authentication_required',
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
+        ...orderTikTokResponseDiagnostics(detail),
+      });
+      await clearOrderBinding(state, 'order_history_authentication_failed');
+      throw new StopOrderDomainBatch('订单历史请求需要重新登录。');
+    }
+    if (detailPayload === null) {
+      await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应为空。', {
+        stage: 'order_history',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        failureReason: 'empty_payload',
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
+        ...orderTikTokResponseDiagnostics(detail),
+      });
+      throw new Error(`订单历史响应为空（${nullPayloadDiagnostic(detail)}）`);
+    }
+    const businessFailure = tiktokBusinessFailure(detailPayload, '订单历史');
+    if (businessFailure !== null) {
+      await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史业务响应失败。', {
+        stage: 'order_history',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        failureReason: 'business_code',
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
+        ...orderTikTokResponseDiagnostics(detail),
+      });
+      throw new Error(businessFailure);
+    }
+    const parsed = OrderHistoryResponseSchema.safeParse(detailPayload);
+    if (!parsed.success) {
+      await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应结构校验失败。', {
+        stage: 'order_history',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        failureReason: 'schema_validation',
+        schema: 'OrderHistoryResponseSchema',
+        schemaError: sanitizeDiagnosticText(parsed.error.message).slice(0, 240),
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
+        ...orderTikTokResponseDiagnostics(detail),
+      });
+      throw new Error(`订单历史响应 schema 校验失败：${parsed.error.message}`);
+    }
+    const pageRows = parsed.data.data.order_history;
+    const totalCount = parsed.data.data.total_count;
+    await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'succeeded', '订单历史响应已解析。', {
+      stage: 'order_history',
+      method: 'POST',
+      endpoint: orderTikTokEndpointPath(historyUrl),
+      orderId,
+      page: pageIndex + 1,
+      offset,
+      rowCount: pageRows.length,
+      totalCount,
+      durationMs: Math.max(0, Date.now() - requestStartedAt),
+      ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
+      ...orderTikTokResponseDiagnostics(detail),
+    });
+    if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
+      throw new StopOrderDomainBatch('订单历史分页上传前同步作用域已变化。');
+    }
+    const uploadStartedAt = Date.now();
+    try {
+      await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
+        domain: 'order_history',
+        endpoint: historyUrl,
+        method: 'POST',
+        request: { body: historyBody },
+        response: { status: detail.status, body: detailPayload },
+        createdAt: new Date().toISOString(),
+        mainOrderId: orderId,
+      }));
+      await recordOrderSyncRuntimeLog('order_history', 'erp_upload', 'succeeded', '订单历史分页已写入 ERP。', {
+        stage: 'tts_erp_upload',
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        rowCount: pageRows.length,
+        totalCount,
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        durationMs: Math.max(0, Date.now() - uploadStartedAt),
+      });
+    } catch (error) {
+      await recordOrderSyncRuntimeLog('order_history', 'erp_upload', 'failed', '订单历史分页写入 ERP 失败。', {
+        stage: 'tts_erp_upload',
+        orderId,
+        page: pageIndex + 1,
+        offset,
+        endpoint: orderTikTokEndpointPath(historyUrl),
+        durationMs: Math.max(0, Date.now() - uploadStartedAt),
+        ...orderRequestExceptionDetails(error),
+      });
+      throw error;
+    }
+
+    offset += pageRows.length;
+    if (offset >= totalCount) return;
+    if (pageRows.length === 0) {
+      throw new Error(`订单历史分页未前进：offset=${offset}, total_count=${totalCount}`);
+    }
+  }
+
+  throw new Error(`订单历史分页超过安全上限：${MAX_ORDER_HISTORY_PAGES} 页`);
+}
+
+
 /**
  * 订单历史（order/history）逐单请求并上传。结构与订单详情批次相同（N+1 模式）。
  */
@@ -2452,8 +2656,9 @@ async function processOrderHistoryBatch(
   options: LogisticsBatchOptions = {},
 ): Promise<void> {
   const previous = state.orderProgress?.domains.order_history ?? createDefaultOrderProgress().domains.order_history;
-  const activeRows = rows.filter((entry) => !isCancelledTikTokOrderRow(entry.row));
-  const cancelledSkipped = rows.length - activeRows.length;
+  // Cancellation is terminal only for logistics. History is precisely where
+  // the cancellation timeline is captured, so cancelled orders must run.
+  const activeRows = rows;
   const pendingKeys = pendingOrderDomainKeys(previous, activeRows.map((entry) => ({ key: entry.orderId })));
   const entryById = new Map(activeRows.map((entry) => [entry.orderId, entry]));
   const preservedFailedIds = new Set(options.preservedFailedOrderIds ?? []);
@@ -2462,7 +2667,7 @@ async function processOrderHistoryBatch(
     ...preservedFailedIds,
   ]);
   let lastError = previous.lastError;
-  const terminalCount = Math.max(0, terminalSkipped) + cancelledSkipped;
+  const terminalCount = Math.max(0, terminalSkipped);
   const roundTotal = activeRows.length + terminalCount;
   const progressTotal = Math.max(roundTotal, options.total ?? roundTotal);
   const uploadedBefore = Math.max(0, options.uploadedBefore ?? 0);
@@ -2548,141 +2753,7 @@ async function processOrderHistoryBatch(
         stopped = true;
         break;
       }
-      const historyUrl = tiktokOrderHistoryEndpointUrl(origin, boundTab.sellerId!);
-      const historyBody = createOrderHistoryRequestBody(orderId);
-      const requestStartedAt = Date.now();
-      let detail: BoundTikTokResponse;
-      try {
-        detail = await executeTikTokRequestWithTimeout(
-          boundTab.tabId, historyUrl, historyBody, 'POST', ORDER_ITEM_REQUEST_TIMEOUT_MS,
-        );
-      } catch (error) {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史请求异常。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody),
-          ...orderRequestExceptionDetails(error),
-        });
-        throw error;
-      }
-      const detailPayload = isRecord(detail.payload) ? detail.payload : null;
-      const detailBusinessFailure = detailPayload === null
-        ? null
-        : tiktokBusinessFailure(detailPayload, '订单历史');
-      const detailSchemaResult = detailPayload === null
-        ? null
-        : OrderHistoryResponseSchema.safeParse(detailPayload);
-      if (!detail.ok) {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应失败。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
-          ...orderTikTokResponseDiagnostics(detail),
-        });
-        if (isTikTokAuthenticationFailure(detail)) {
-          await clearOrderBinding(state, 'order_history_authentication_failed');
-          stopped = true;
-        }
-        attemptError = orderTikTokFailureSummary('订单历史请求失败', detail);
-      } else if (isTikTokAuthenticationFailure(detail)) {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应要求重新登录。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          failureReason: 'authentication_required',
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
-          ...orderTikTokResponseDiagnostics(detail),
-        });
-        await clearOrderBinding(state, 'order_history_authentication_failed');
-        stopped = true;
-        attemptError = '订单历史请求需要重新登录。';
-      } else if (detailPayload === null) {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应为空。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          failureReason: 'empty_payload',
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
-          ...orderTikTokResponseDiagnostics(detail),
-        });
-        attemptError = `订单历史响应为空（${nullPayloadDiagnostic(detail)}）`;
-      } else if (detailBusinessFailure !== null) {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史业务响应失败。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          failureReason: 'business_code',
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
-          ...orderTikTokResponseDiagnostics(detail),
-        });
-        attemptError = detailBusinessFailure;
-      } else if (!detailSchemaResult?.success) {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'failed', '订单历史响应结构校验失败。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          failureReason: 'schema_validation',
-          schema: 'OrderHistoryResponseSchema',
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
-          ...orderTikTokResponseDiagnostics(detail),
-        });
-        attemptError = `订单历史响应 schema 校验失败：${detailSchemaResult?.error.message ?? 'unknown error'}`;
-      } else {
-        await recordOrderSyncRuntimeLog('order_history', 'tiktok_request', 'succeeded', '订单历史响应已解析。', {
-          stage: 'order_history',
-          method: 'POST',
-          endpoint: orderTikTokEndpointPath(historyUrl),
-          orderId,
-          durationMs: Math.max(0, Date.now() - requestStartedAt),
-          ...orderTikTokRuntimeExchange('POST', historyUrl, historyBody, detail),
-          ...orderTikTokResponseDiagnostics(detail),
-        });
-        if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('order_history', state)) {
-          stopped = true;
-          break;
-        }
-        const uploadStartedAt = Date.now();
-        try {
-          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
-            domain: 'order_history',
-            endpoint: historyUrl,
-            method: 'POST',
-            request: { body: historyBody },
-            response: { status: detail.status, body: detailPayload },
-            createdAt: new Date().toISOString(),
-            mainOrderId: orderId,
-          }));
-          await recordOrderSyncRuntimeLog('order_history', 'erp_upload', 'succeeded', '订单历史已写入 ERP。', {
-            stage: 'tts_erp_upload',
-            orderId,
-            endpoint: orderTikTokEndpointPath(historyUrl),
-            durationMs: Math.max(0, Date.now() - uploadStartedAt),
-          });
-        } catch (error) {
-          await recordOrderSyncRuntimeLog('order_history', 'erp_upload', 'failed', '订单历史写入 ERP 失败。', {
-            stage: 'tts_erp_upload',
-            orderId,
-            endpoint: orderTikTokEndpointPath(historyUrl),
-            durationMs: Math.max(0, Date.now() - uploadStartedAt),
-            ...orderRequestExceptionDetails(error),
-          });
-          throw error;
-        }
-      }
+      await syncOrderHistoryPages(state, settings, scope, boundTab, origin, orderId);
     } catch (error) {
       if (error instanceof StopOrderDomainBatch) {
         stopped = true;
@@ -2967,6 +3038,144 @@ async function fetchStatementRows(state: OrderSyncState): Promise<StatementPolli
 }
 
 
+async function fetchStatementSkuDetailRefs(
+  state: OrderSyncState,
+  statement: Pick<StatementPollingRow, 'statementId' | 'statementVersion'>,
+): Promise<StatementSkuDetailRef[]> {
+  const boundTab = state.boundTab!;
+  const origin = TIKTOK_STATEMENT_API_ORIGIN;
+  const identity = { sellerId: boundTab.sellerId!, region: orderShopRegion(state)! };
+  const refs = new Map<string, StatementSkuDetailRef>();
+  const variants = [
+    { settlementStatus: 1 as const, pageType: 10 as const },
+    { settlementStatus: 2 as const, pageType: 6 as const },
+  ];
+
+  for (const variant of variants) {
+    let from = 0;
+    let hasMore = true;
+    for (let page = 0; page < MAX_STATEMENT_LIST_PAGES; page += 1) {
+      if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('statements', state)) {
+        throw new StopOrderDomainBatch('结算订单明细列表请求前同步作用域已变化。');
+      }
+      const query = createStatementOrderListQuery({
+        statementId: statement.statementId,
+        statementVersion: statement.statementVersion,
+        from,
+        size: STATEMENT_LIST_PAGE_SIZE,
+        ...variant,
+      });
+      const url = tiktokStatementEndpointUrl(origin, 'statement-order-list', identity, query);
+      const requestStartedAt = Date.now();
+      let response: BoundTikTokResponse;
+      try {
+        response = await executeTikTokRequestWithTimeout(
+          boundTab.tabId, url, {}, 'POST', ORDER_ITEM_REQUEST_TIMEOUT_MS,
+        );
+      } catch (error) {
+        await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'failed', '结算订单明细列表请求异常。', {
+          stage: 'statement_order_list',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(url),
+          statementId: statement.statementId,
+          statementVersion: statement.statementVersion,
+          settlementStatus: variant.settlementStatus,
+          page: page + 1,
+          from,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', url, undefined),
+          ...orderRequestExceptionDetails(error),
+        });
+        throw error;
+      }
+      if (!response.ok) {
+        await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'failed', '结算订单明细列表响应失败。', {
+          stage: 'statement_order_list',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(url),
+          statementId: statement.statementId,
+          statementVersion: statement.statementVersion,
+          settlementStatus: variant.settlementStatus,
+          page: page + 1,
+          from,
+          durationMs: Math.max(0, Date.now() - requestStartedAt),
+          ...orderTikTokRuntimeExchange('POST', url, undefined, response),
+          ...orderTikTokResponseDiagnostics(response),
+        });
+        if (isTikTokAuthenticationFailure(response)) {
+          await clearOrderBinding(state, 'statement_order_list_authentication_failed');
+          throw new StopOrderDomainBatch('结算订单明细列表请求需要重新登录。');
+        }
+        throw new Error(orderTikTokFailureSummary('结算订单明细列表请求失败', response));
+      }
+      if (isTikTokAuthenticationFailure(response)) {
+        await clearOrderBinding(state, 'statement_order_list_authentication_failed');
+        throw new StopOrderDomainBatch('结算订单明细列表请求需要重新登录。');
+      }
+      const payload = isRecord(response.payload) ? response.payload : null;
+      if (payload === null) {
+        throw new Error(`结算订单明细列表响应为空（${nullPayloadDiagnostic(response)}）`);
+      }
+      const businessFailure = tiktokBusinessFailure(payload, '结算订单明细列表');
+      if (businessFailure !== null) throw new Error(businessFailure);
+      const parsed = StatementOrderListResponseSchema.safeParse(payload);
+      if (!parsed.success) {
+        await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'failed', '结算订单明细列表响应结构校验失败。', {
+          stage: 'statement_order_list',
+          method: 'POST',
+          endpoint: orderTikTokEndpointPath(url),
+          statementId: statement.statementId,
+          statementVersion: statement.statementVersion,
+          settlementStatus: variant.settlementStatus,
+          page: page + 1,
+          from,
+          failureReason: 'schema_validation',
+          schema: 'StatementOrderListResponseSchema',
+          schemaError: sanitizeDiagnosticText(parsed.error.message).slice(0, 240),
+          ...orderTikTokRuntimeExchange('POST', url, undefined, response),
+          ...orderTikTokResponseDiagnostics(response),
+        });
+        throw new Error(`结算订单明细列表响应 schema 校验失败：${parsed.error.message}`);
+      }
+      for (const ref of extractStatementSkuDetailRefs(parsed.data, statement)) {
+        refs.set(ref.statementSkuDetailId, ref);
+      }
+      const pageRows = parsed.data.data.order_records;
+      const parsedTotal = Number(parsed.data.data.total_record);
+      const total = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : null;
+      await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'succeeded', '结算订单明细列表响应已解析。', {
+        stage: 'statement_order_list',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(url),
+        statementId: statement.statementId,
+        statementVersion: statement.statementVersion,
+        settlementStatus: variant.settlementStatus,
+        page: page + 1,
+        from,
+        rowCount: pageRows.length,
+        totalRecord: total,
+        discoveredSkuDetails: refs.size,
+        ...orderTikTokRuntimeExchange('POST', url, undefined, response),
+        ...orderTikTokResponseDiagnostics(response),
+      });
+      hasMore = parsed.data.data.search_next_has_more === true
+        || (total !== null && from + pageRows.length < total);
+      if (!hasMore || pageRows.length === 0) break;
+      from += pageRows.length;
+    }
+    if (hasMore) throw new Error('结算订单明细列表分页超过安全上限。');
+  }
+
+  await recordOrderSyncRuntimeLog('statements', 'statement_detail_refs_discovered', 'succeeded', '结算 SKU 明细引用发现完成。', {
+    stage: 'statement_order_list',
+    statementId: statement.statementId,
+    statementVersion: statement.statementVersion,
+    detailCount: refs.size,
+  });
+  return [...refs.values()];
+}
+
+
 /** 订单域：列表 1 次请求拿到全部字段，逐单上传（无需详情请求）。 */
 let logFlushInFlight = false;
 
@@ -3208,7 +3417,7 @@ function createOrderPagePipeline(
   boundTab: NonNullable<OrderSyncState['boundTab']>,
   origin: string,
   trigger: OrderSyncTrigger,
-): (page: OrderListPage) => Promise<void> {
+): OrderPagePipeline {
   let uploaded = 0;
   const failedOrderIds = new Set<string>();
   let logisticsUploaded = 0;
@@ -3228,12 +3437,13 @@ function createOrderPagePipeline(
     logisticsQueueRunning = true;
     orderDomainInFlight.add('logistics');
     try {
-      await beginOrderDomainRun('logistics', trigger);
+      const startedState = await beginOrderDomainRun('logistics', trigger);
+      const runState = withCurrentOrderDomainRun(state, startedState, 'logistics');
       while (logisticsQueue.length > 0) {
         const item = logisticsQueue.shift()!;
         try {
           await processLogisticsBatch(
-            state,
+            runState,
             settings,
             scope,
             boundTab,
@@ -3260,6 +3470,7 @@ function createOrderPagePipeline(
             stage: 'logistics_page_queue',
             error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
           });
+          if (await isOrderSyncScopeCurrent(runState)) await deferOrderDomainAlarm('logistics');
           break;
         }
       }
@@ -3303,12 +3514,13 @@ function createOrderPagePipeline(
     detailsQueueRunning = true;
     orderDomainInFlight.add('order_details');
     try {
-      await beginOrderDomainRun('order_details', trigger);
+      const startedState = await beginOrderDomainRun('order_details', trigger);
+      const runState = withCurrentOrderDomainRun(state, startedState, 'order_details');
       while (detailsQueue.length > 0) {
         const item = detailsQueue.shift()!;
         try {
           await processOrderDetailsBatch(
-            state, settings, scope, boundTab, origin,
+            runState, settings, scope, boundTab, origin,
             item.rows, 0,
             {
               total: item.total,
@@ -3330,6 +3542,7 @@ function createOrderPagePipeline(
             stage: 'order_details_page_queue',
             error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
           });
+          if (await isOrderSyncScopeCurrent(runState)) await deferOrderDomainAlarm('order_details');
           break;
         }
       }
@@ -3368,12 +3581,13 @@ function createOrderPagePipeline(
     historyQueueRunning = true;
     orderDomainInFlight.add('order_history');
     try {
-      await beginOrderDomainRun('order_history', trigger);
+      const startedState = await beginOrderDomainRun('order_history', trigger);
+      const runState = withCurrentOrderDomainRun(state, startedState, 'order_history');
       while (historyQueue.length > 0) {
         const item = historyQueue.shift()!;
         try {
           await processOrderHistoryBatch(
-            state, settings, scope, boundTab, origin,
+            runState, settings, scope, boundTab, origin,
             item.rows, 0,
             {
               total: item.total,
@@ -3395,6 +3609,7 @@ function createOrderPagePipeline(
             stage: 'order_history_page_queue',
             error: error instanceof Error ? sanitizeDiagnosticText(error.message).slice(0, 240) : String(error),
           });
+          if (await isOrderSyncScopeCurrent(runState)) await deferOrderDomainAlarm('order_history');
           break;
         }
       }
@@ -3568,7 +3783,12 @@ function createOrderPagePipeline(
       nextPage: page.hasMore ? page.page + 1 : null,
     });
   };
-  return pagePipeline;
+  const drain = async (): Promise<void> => {
+    const activeDrains = [logisticsDrainPromise, detailsDrainPromise, historyDrainPromise]
+      .filter((promise): promise is Promise<void> => promise !== null);
+    await Promise.all(activeDrains);
+  };
+  return { onPage: pagePipeline, drain };
 }
 
 
@@ -3595,7 +3815,9 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
 
   let selection: OrderRoundSelection;
   try {
-    selection = await fetchOrderRowsForRound(state, settings, scope, reconciliation, previous, pagePipeline);
+    selection = await fetchOrderRowsForRound(
+      state, settings, scope, reconciliation, previous, pagePipeline.onPage,
+    );
   } catch (error) {
     if (error instanceof StopOrderDomainBatch) {
       await recordOrderSyncRuntimeLog('orders', 'poll_stopped', 'skipped', '订单主动轮询因同步作用域变化而停止。', {
@@ -3621,6 +3843,8 @@ async function handleOrderSyncAlarmOnce(trigger: OrderSyncTrigger): Promise<bool
     }, 'partial', state);
     await scheduleOrderDomainRetryAfterListFailure('orders', state);
     return false;
+  } finally {
+    await pagePipeline.drain();
   }
   if (selection.streamed) {
     const streamedState = await getOrderSyncState();
@@ -4109,7 +4333,14 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
             statementId: statement.statementId,
             statementVersion: statement.statementVersion,
           }));
-          if (statement.statementSkuDetailId === undefined) return;
+          const detailRefs: StatementSkuDetailRef[] = statement.statementSkuDetailId === undefined
+            ? await fetchStatementSkuDetailRefs(state, statement)
+            : [{
+                statementSkuDetailId: statement.statementSkuDetailId,
+                statementId: statement.statementId,
+                statementVersion: statement.statementVersion,
+              }];
+          for (const detailRef of detailRefs) {
           // 结算头上传可能改变绑定、令牌或暂停状态。明细是独立请求，
           // 必须重新确认仍属于同一同步作用域，不能继续向旧配置写数据。
           if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('statements', state)) {
@@ -4120,8 +4351,8 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
             'statement-transaction-detail',
             { sellerId: boundTab.sellerId!, region: orderShopRegion(state)! },
             createStatementTransactionDetailQuery({
-              statementSkuDetailId: statement.statementSkuDetailId,
-              statementVersion: statement.statementVersion,
+              statementSkuDetailId: detailRef.statementSkuDetailId,
+              statementVersion: detailRef.statementVersion,
             }),
           );
           const requestStartedAt = Date.now();
@@ -4205,6 +4436,33 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
             });
             throw new Error(businessFailure);
           }
+          const parsedDetail = StatementTransactionDetailResponseSchema.safeParse(detailPayload);
+          if (!parsedDetail.success) {
+            await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'failed', '结算明细响应结构校验失败。', {
+              stage: 'statement_detail',
+              method: 'GET',
+              endpoint: orderTikTokEndpointPath(detailUrl),
+              statementId: statement.statementId,
+              statementVersion: statement.statementVersion,
+              failureReason: 'schema_validation',
+              schema: 'StatementTransactionDetailResponseSchema',
+              schemaError: sanitizeDiagnosticText(parsedDetail.error.message).slice(0, 240),
+              durationMs: Math.max(0, Date.now() - requestStartedAt),
+              ...orderTikTokRuntimeExchange('GET', detailUrl, undefined, detail),
+              ...orderTikTokResponseDiagnostics(detail),
+            });
+            throw new Error(`结算明细响应 schema 校验失败：${parsedDetail.error.message}`);
+          }
+          const detailRecord = parsedDetail.data.data.sku_record;
+          if (detailRecord.statement_id !== detailRef.statementId
+            || detailRecord.statement_version !== detailRef.statementVersion
+            || detailRecord.statement_sku_detail_id !== detailRef.statementSkuDetailId) {
+            throw new Error(
+              `结算明细身份不匹配：expected ${detailRef.statementId}@${detailRef.statementVersion}`
+              + `/${detailRef.statementSkuDetailId}, received ${detailRecord.statement_id}`
+              + `@${detailRecord.statement_version}/${detailRecord.statement_sku_detail_id}`,
+            );
+          }
           await recordOrderSyncRuntimeLog('statements', 'tiktok_request', 'succeeded', '结算明细响应已解析。', {
             stage: 'statement_detail',
             method: 'GET',
@@ -4229,6 +4487,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
             statementId: statement.statementId,
             statementVersion: statement.statementVersion,
           }));
+          }
         },
       };
     }),
@@ -4444,7 +4703,10 @@ async function ensureBoundAlarm(
   const hasCheckpoint = (row?.pending ?? 0) > 0
     || row?.resumeOrderId !== null && row?.resumeOrderId !== undefined
     || (row?.failedOrderIds?.length ?? 0) > 0
-    || row?.currentOrderId !== null && row?.currentOrderId !== undefined;
+    || row?.currentOrderId !== null && row?.currentOrderId !== undefined
+    || row?.syncRunStatus === 'running'
+    || row?.listPhase === 'list_fetching'
+    || row?.listPhase === 'processing';
   if (hasCheckpoint) {
     if (existing && typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(name);
     await chrome.alarms.create(name, { delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES });
@@ -4472,13 +4734,16 @@ function orderDomainIsInFlight(domain: OrderPollingDomain): boolean {
 }
 
 
-async function beginOrderDomainRun(domain: OrderPollingDomain, trigger: OrderSyncTrigger): Promise<void> {
+async function beginOrderDomainRun(
+  domain: OrderPollingDomain,
+  trigger: OrderSyncTrigger,
+): Promise<OrderSyncState> {
   const current = await getOrderSyncState();
-  const previous = current.orderProgress?.domains[domain];
+  const previous = current.orderProgress.domains[domain];
   // A continuation alarm resumes the same durable run and trigger.
-  if (previous?.syncRunStatus === 'running' && previous.syncRunId) {
+  if (previous.syncRunStatus === 'running' && previous.syncRunId) {
     await recordOrderProgress(domain, { lastProgressAt: new Date().toISOString() }, 'running');
-    return;
+    return getOrderSyncState();
   }
   const now = new Date().toISOString();
   await recordOrderProgress(domain, {
@@ -4487,6 +4752,25 @@ async function beginOrderDomainRun(domain: OrderPollingDomain, trigger: OrderSyn
     syncRunStatus: 'running',
     lastProgressAt: now,
   }, 'running');
+  return getOrderSyncState();
+}
+
+
+function withCurrentOrderDomainRun(
+  expectedState: OrderSyncState,
+  currentState: OrderSyncState,
+  domain: OrderPollingDomain,
+): OrderSyncState {
+  return {
+    ...expectedState,
+    orderProgress: {
+      ...expectedState.orderProgress,
+      domains: {
+        ...expectedState.orderProgress.domains,
+        [domain]: currentState.orderProgress.domains[domain],
+      },
+    },
+  };
 }
 
 

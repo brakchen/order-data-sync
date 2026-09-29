@@ -116,6 +116,18 @@ describe('order domain concurrent scope changes', () => {
     expect(injection?.args?.[4]).toBeNull();
   });
 
+  it('does not duplicate a page request after the bridge watchdog times out', async () => {
+    vi.mocked(chrome.tabs.sendMessage).mockResolvedValueOnce({
+      ok: false,
+      errorName: 'PageProxyTimeoutError',
+      errorMessage: 'page bridge timed out',
+    });
+
+    await handleOrderSyncAlarm();
+
+    expect(chrome.scripting.executeScript).not.toHaveBeenCalled();
+  });
+
   it('does not upload an old seller page into the newly bound seller', async () => {
     vi.mocked(chrome.scripting.executeScript).mockImplementation(async () => {
       harness.state = stateFor('seller-B');
@@ -144,7 +156,7 @@ describe('order domain concurrent scope changes', () => {
     expect(harness.state?.boundTab?.sellerId).toBe('seller-B');
   });
 
-  it('keeps the order domain done while its logistics consumer is still running', async () => {
+  it('keeps the alarm alive until its logistics consumer reaches a durable checkpoint', async () => {
     let resolveLogistics!: (result: ReturnType<typeof pageResult>) => void;
     vi.mocked(chrome.scripting.executeScript).mockImplementation(async (options) => {
       const url = String(options.args?.[0] ?? '');
@@ -171,17 +183,21 @@ describe('order domain concurrent scope changes', () => {
       }) as never;
     });
 
-    await handleOrderSyncAlarm();
-    for (let index = 0; index < 100 && !resolveLogistics; index += 1) await Promise.resolve();
+    let alarmCompleted = false;
+    const running = handleOrderSyncAlarm().finally(() => { alarmCompleted = true; });
+    for (let index = 0; index < 100 && (
+      !resolveLogistics || harness.state?.orderProgress.domains.logistics.syncRunStatus !== 'running'
+    ); index += 1) await new Promise((resolve) => setTimeout(resolve, 10));
 
+    expect(resolveLogistics).toBeTypeOf('function');
+    expect(alarmCompleted).toBe(false);
     expect(harness.state?.orderProgress.domains.orders.syncRunStatus).toBe('done');
     expect(harness.state?.orderProgress.domains.logistics.syncRunStatus).toBe('running');
     expect(harness.state?.orderProgress.status).toBe('running');
 
     resolveLogistics(pageResult({ code: 0, data: { detail: true } }));
-    for (let index = 0; index < 100 && harness.state?.orderProgress.domains.logistics.syncRunStatus !== 'done'; index += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    await running;
+
     expect(harness.state?.orderProgress.domains.logistics.syncRunStatus).toBe('done');
     expect(harness.state?.orderProgress.status).toBe('ok');
   });

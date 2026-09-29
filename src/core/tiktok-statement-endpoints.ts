@@ -9,6 +9,7 @@
 
 export const TIKTOK_STATEMENT_ENDPOINT_PATHS = {
   'statement-list': '/api/v1/pay/statement/list/detail',
+  'statement-order-list': '/api/v1/pay/statement/order/list',
   'statement-transaction-detail': '/api/v1/pay/statement/transaction/detail',
 } as const;
 
@@ -65,6 +66,32 @@ export function createStatementListQuery(input: {
     statement_version: String(input.statementVersion ?? 0),
   };
   return query;
+}
+
+/**
+ * Query params for the statement drill-down that exposes nested
+ * sku_records[].statement_sku_detail_id values.
+ */
+export function createStatementOrderListQuery(input: {
+  statementId: string;
+  statementVersion: number;
+  from?: number;
+  size?: number;
+  settlementStatus?: 1 | 2;
+  pageType?: 6 | 10;
+}): Record<string, string> {
+  return {
+    pagination_type: '1',
+    from: String(input.from ?? 0),
+    size: String(input.size ?? 50),
+    terminal_type: '1',
+    page_type: String(input.pageType ?? 6),
+    statement_id: input.statementId,
+    settlement_status: String(input.settlementStatus ?? 2),
+    no_need_sku_record: 'false',
+    need_total_amount: 'false',
+    statement_version: String(input.statementVersion),
+  };
 }
 
 /** Query params for statement/transaction/detail (GET — no body). */

@@ -61,6 +61,66 @@ export const StatementListResponseSchema = z.object({
 
 export type StatementListResponse = z.infer<typeof StatementListResponseSchema>;
 
+// ─── Statement order/SKU bridge list ─────────────────────────────────
+
+export const StatementOrderSkuRecordSchema = z.object({
+  statement_sku_detail_id: z.string().min(1),
+  statement_id: z.string().min(1).optional(),
+  statement_version: z.number().int().optional(),
+  sku_id: z.union([z.string(), z.number()]).optional(),
+}).passthrough();
+
+export const StatementOrderRecordSchema = z.object({
+  statement_id: z.string().min(1).optional(),
+  statement_version: z.number().int().optional(),
+  trade_order_id: z.string().optional(),
+  sku_records: z.array(StatementOrderSkuRecordSchema).optional().default([]),
+}).passthrough();
+
+export const StatementOrderListResponseSchema = z.object({
+  code: z.number(),
+  message: z.string(),
+  data: z.object({
+    search_next_cursor: z.string().optional(),
+    search_next_has_more: z.boolean().optional(),
+    total_record: z.union([z.number(), z.string()]).optional(),
+    order_records: z.array(StatementOrderRecordSchema),
+  }).passthrough(),
+}).passthrough();
+
+export type StatementOrderListResponse = z.infer<typeof StatementOrderListResponseSchema>;
+export type StatementSkuDetailRef = {
+  statementSkuDetailId: string;
+  statementId: string;
+  statementVersion: number;
+};
+
+/** Extract and de-duplicate SKU detail IDs from a validated statement drill-down page. */
+export function extractStatementSkuDetailRefs(
+  response: StatementOrderListResponse,
+  expected: { statementId: string; statementVersion: number },
+): StatementSkuDetailRef[] {
+  const refs = new Map<string, StatementSkuDetailRef>();
+  for (const order of response.data.order_records) {
+    for (const sku of order.sku_records) {
+      const statementId = sku.statement_id ?? order.statement_id ?? expected.statementId;
+      const statementVersion = sku.statement_version ?? order.statement_version ?? expected.statementVersion;
+      if (statementId !== expected.statementId || statementVersion !== expected.statementVersion) {
+        throw new Error(
+          `statement/order/list identity mismatch: expected ${expected.statementId}@${expected.statementVersion}, `
+          + `received ${statementId}@${statementVersion}`,
+        );
+      }
+      refs.set(sku.statement_sku_detail_id, {
+        statementSkuDetailId: sku.statement_sku_detail_id,
+        statementId,
+        statementVersion,
+      });
+    }
+  }
+  return [...refs.values()];
+}
+
 // ─── Statement transaction detail ────────────────────────────────────
 
 /**

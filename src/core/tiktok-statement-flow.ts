@@ -3,9 +3,9 @@
  *
  * No chrome.* imports. The caller injects a fetch handler.
  *
- * Known gap: statement/list/detail does NOT return statement_sku_detail_id.
- * The caller must obtain that ID from another source (a not-yet-captured
- * intermediate endpoint) before calling fetchStatementTransactionDetail.
+ * statement/list/detail does NOT return statement_sku_detail_id. Production
+ * callers discover it through statement/order/list before calling
+ * fetchStatementTransactionDetail.
  */
 
 import {
@@ -122,8 +122,7 @@ export async function fetchStatementList(
  * Fetch a single SKU-level settlement detail.
  *
  * Requires statement_sku_detail_id — the caller must already have it.
- * The statement list endpoint does NOT return this field; obtaining it
- * requires a not-yet-captured intermediate endpoint (see codex doc §4).
+ * Obtain the ID from statement/order/list sku_records before calling.
  */
 export async function fetchStatementTransactionDetail(
   handlers: StatementFlowHandlers,

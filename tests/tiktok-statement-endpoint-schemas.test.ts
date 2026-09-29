@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
   createStatementListQuery,
+  createStatementOrderListQuery,
   createStatementTransactionDetailQuery,
   tiktokStatementEndpointUrl,
   TIKTOK_STATEMENT_ENDPOINT_PATHS,
 } from '../src/core/tiktok-statement-endpoints';
 import {
   StatementListResponseSchema,
+  StatementOrderListResponseSchema,
   StatementTransactionDetailResponseSchema,
   extractStatementIds,
   extractStatementSkuDetailId,
+  extractStatementSkuDetailRefs,
   TikTokMoneySchema,
 } from '../src/core/tiktok-statement-endpoint-schemas';
 
@@ -18,6 +21,7 @@ import {
 describe('TIKTOK_STATEMENT_ENDPOINT_PATHS', () => {
   it('has the expected paths', () => {
     expect(TIKTOK_STATEMENT_ENDPOINT_PATHS['statement-list']).toBe('/api/v1/pay/statement/list/detail');
+    expect(TIKTOK_STATEMENT_ENDPOINT_PATHS['statement-order-list']).toBe('/api/v1/pay/statement/order/list');
     expect(TIKTOK_STATEMENT_ENDPOINT_PATHS['statement-transaction-detail']).toBe('/api/v1/pay/statement/transaction/detail');
   });
 });
@@ -39,6 +43,26 @@ describe('createStatementListQuery', () => {
     const query = createStatementListQuery({ from: 20, size: 50 });
     expect(query.from).toBe('20');
     expect(query.size).toBe('50');
+  });
+});
+
+describe('createStatementOrderListQuery', () => {
+  it('builds the captured statement drill-down query', () => {
+    expect(createStatementOrderListQuery({
+      statementId: 'statement-1',
+      statementVersion: 3,
+    })).toEqual({
+      pagination_type: '1',
+      from: '0',
+      size: '50',
+      terminal_type: '1',
+      page_type: '6',
+      statement_id: 'statement-1',
+      settlement_status: '2',
+      no_need_sku_record: 'false',
+      need_total_amount: 'false',
+      statement_version: '3',
+    });
   });
 });
 
@@ -156,6 +180,60 @@ describe('extractStatementIds', () => {
   // 不可区分，调用方继续按 0 行同步会静默丢结算记录）。
   it('throws on invalid response (parse failure surfaces as error)', () => {
     expect(() => extractStatementIds({})).toThrow(/schema\/parse failed/);
+  });
+});
+
+// ─── Statement order/SKU bridge list ─────────────────────────────────
+
+describe('StatementOrderListResponseSchema', () => {
+  const response = {
+    code: 0,
+    message: 'success',
+    data: {
+      total_record: 2,
+      search_next_has_more: false,
+      order_records: [
+        {
+          statement_id: 'statement-1',
+          statement_version: 3,
+          trade_order_id: 'order-1',
+          sku_records: [
+            { statement_sku_detail_id: 'detail-1', sku_id: 'sku-1' },
+            { statement_sku_detail_id: 'detail-2', sku_id: 'sku-2' },
+          ],
+        },
+        { statement_id: 'statement-1', statement_version: 3 },
+      ],
+    },
+  };
+
+  it('validates nested SKU refs and ignores fee-only records', () => {
+    const parsed = StatementOrderListResponseSchema.parse(response);
+    expect(extractStatementSkuDetailRefs(parsed, {
+      statementId: 'statement-1',
+      statementVersion: 3,
+    })).toEqual([
+      { statementSkuDetailId: 'detail-1', statementId: 'statement-1', statementVersion: 3 },
+      { statementSkuDetailId: 'detail-2', statementId: 'statement-1', statementVersion: 3 },
+    ]);
+  });
+
+  it('rejects empty nested detail IDs', () => {
+    expect(StatementOrderListResponseSchema.safeParse({
+      ...response,
+      data: {
+        ...response.data,
+        order_records: [{ sku_records: [{ statement_sku_detail_id: '' }] }],
+      },
+    }).success).toBe(false);
+  });
+
+  it('rejects refs from a different statement identity', () => {
+    const parsed = StatementOrderListResponseSchema.parse(response);
+    expect(() => extractStatementSkuDetailRefs(parsed, {
+      statementId: 'different',
+      statementVersion: 3,
+    })).toThrow('identity mismatch');
   });
 });
 
