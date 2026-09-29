@@ -342,7 +342,7 @@ async function captureSellerIdentity(
     sameSellerCenterOrigin,
     capturedFromTabId: senderTabId,
     boundTabId: current.boundTab?.tabId ?? null,
-    pageOrigin: new URL(payload.url).origin,
+    pageOrigin: safeUrlOrigin(payload.url),
   });
   await ensureBoundAlarms('configuration_ready');
   return next;
@@ -565,7 +565,7 @@ async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<voi
   await recordOrderSyncRuntimeLog('all', 'seller_auto_bind_requested', 'started', '已自动绑定可用的 Seller Center 页面，不刷新当前页面，等待接口请求捕获 Seller ID。', {
     stage: 'seller_binding',
     tabId,
-    pageOrigin: new URL(tabUrl).origin,
+    pageOrigin: safeUrlOrigin(tabUrl),
     reloadRequested: false,
     reusedPinnedTab: candidateWasPinned,
   });
@@ -654,7 +654,7 @@ async function handleLoginRedirect(tabId: number): Promise<void> {
   await orderSyncStateStore.update((state) => {
     if (!state.boundTab) return state;
     const { sellerId: _sellerId, ...withoutSellerId } = state.boundTab;
-    return { ...state, boundTab: { ...withoutSellerId, url: `https://${new URL(state.boundTab.url).host}/account/login` } };
+    return { ...state, boundTab: { ...withoutSellerId, url: sellerCenterLoginUrl(state.boundTab.url) } };
   });
   await recordOrderSyncRuntimeLog('all', 'seller_login_redirect', 'skipped', '绑定页面进入登录页，保留同步断点等待重新登录。', {
     stage: 'seller_binding',
@@ -783,7 +783,7 @@ async function autoRebindSellerTab(
     reason,
     previousTabId: previousBoundTab.tabId,
     replacementTabId: tabId,
-    pageOrigin: new URL(tabUrl).origin,
+    pageOrigin: safeUrlOrigin(tabUrl),
     preservedProgress: true,
   });
   await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_ready', 'succeeded', '已自动接管可用的 Seller Center 页面，不刷新当前页面，继续使用现有会话。', {
@@ -1034,6 +1034,16 @@ function isTikTokLoginPage(value: string): boolean {
 function isHttpUrl(value: string): boolean {
   try { const url = new URL(value); return url.protocol === 'https:' || url.protocol === 'http:'; }
   catch { return false; }
+}
+
+function safeUrlOrigin(value: string): string | null {
+  try { return new URL(value).origin; }
+  catch { return null; }
+}
+
+function sellerCenterLoginUrl(value: string): string {
+  try { return `https://${new URL(value).host}/account/login`; }
+  catch { return value; }
 }
 
 function reportError(error: unknown, source = 'background'): void {

@@ -107,13 +107,24 @@ function runtimeLogContext(
 }
 const RUNTIME_SECRET_KEY = /(token|auth|authorization|cookie|password|secret|credential|signature|bsid|access[_-]?key|refresh[_-]?token)/i;
 
-function sanitizeRuntimeLogValue(value: unknown): unknown {
+type SanitizedRuntimeLogValue =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | SanitizedRuntimeLogValue[]
+  | { [key: string]: SanitizedRuntimeLogValue };
+
+function sanitizeRuntimeLogValue(value: unknown): SanitizedRuntimeLogValue {
   if (typeof value === 'string') {
     if (/^https?:\/\//i.test(value)) return sanitizeRuntimeUrl(value);
     return sanitizeDiagnosticText(value).slice(0, 20_000);
   }
   if (Array.isArray(value)) return value.map((item) => sanitizeRuntimeLogValue(item));
-  if (!isRecord(value)) return value;
+  if (value === null || value === undefined
+    || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (!isRecord(value)) return String(value);
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [
     key,
     RUNTIME_SECRET_KEY.test(key) ? '[REDACTED]' : sanitizeRuntimeLogValue(item),
