@@ -458,7 +458,9 @@ refund_amount = parseMoney(biz_data.return_price)
 
 - `DumpDomain.AFTER_SALES` 已接入；
 - 数据表在 `plugin.after_sales` 与 `plugin.after_sale_items`；
+- 当前只有 `plugin.after_sale_items.refund_amount/currency`，`plugin.after_sales` 没有订单级退款金额列；
 - 当前 parser 预期的是假设 shape：`/return_refund/202309/cancellations/search -> data.cancellations[].cancel_line_items[].refund_amount.amount`；
+- 真实 `return_price` 是退款 card/售后单级金额，而不是已确认的 line-item 金额。结合“不存在部分退款”的业务规则，当前落库粒度也不匹配：应优先在 `plugin.after_sales` 保存订单级 `refund_amount/currency`，而不是强行构造虚假的行级拆分；
 - 该 shape 与已抓到的 `reverse/component/orders/list -> data.cards[].biz_data.return_price` 不一致。
 
 ### 状态和退货物流
@@ -559,7 +561,7 @@ Chrome local storage 保存：
 | 优先级 | 问题 | 业务影响 | 建议 |
 | --- | --- | --- | --- |
 | P0 | order history 多页都从 event_index=0 upsert | 历史页互相覆盖；退款/取消时间线丢失 | 建立带 offset 或稳定 event key 的跨仓库契约测试并修复 |
-| P0/P1 | 没有 after_sales 采集管道，且服务端 parser 与真实退款列表 shape 不一致 | 退款事实、金额、状态和退货物流不能按 contract 写入 `plugin` schema | 以已抓到的 `reverse/component/orders/list` 为起点建立 golden fixture 和双端 schema；继续抓退款详情/退货物流 |
+| P0/P1 | 没有 after_sales 采集管道；parser shape 和退款金额落库粒度都与真实 response 不一致 | `return_price` 是订单/售后单级，但当前只有 `plugin.after_sale_items.refund_amount`；退款事实、金额、状态和退货物流无法正确落库 | 以真实 `reverse/component/orders/list` 建立双端 schema；在 `plugin.after_sales` 增加订单级退款金额/币种，再继续抓退款详情/退货物流 |
 | P1 | health gate 跳过后可能不再安排 alarm；恢复回调只走首次同步 | 服务恢复后 domain 可能永久卡在 running，直到页面事件或人工干预 | gate 前不要 begin run；或 skipped 时明确安排 continuation；恢复时触发 resume 而不是 initial-only |
 | P1 | permanent upload error 仍进入 continuation queue | 413/422 数据会无限重试并制造日志/请求风暴 | queue 按 retryable/permanent/needs-human 分类 |
 | P1 | 五条生产管道没有统一 T-1 cutoff | 今天的数据可能提前进入 plugin schema，不符合已确认业务规则 | 建立 shop-local cutoff builder，所有自动/手动入口与 endpoint filter 共用 |
