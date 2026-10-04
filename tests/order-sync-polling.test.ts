@@ -76,6 +76,7 @@ import {
   ensureSettlementSyncAlarm,
   handleOrderSyncAlarm,
   pollOrderDomain,
+  pollTtsErpHealth,
 } from '../src/extension/order-engine';
 import { handleOrderMessage } from '../entrypoints/background';
 import { createDefaultOrderSyncState } from '../src/extension/storage';
@@ -2237,6 +2238,42 @@ describe('售后域（全局取消单列表）', () => {
       pending: 0,
       syncRunStatus: 'done',
     });
+  });
+});
+
+describe('tts-erp 恢复后的上传调度', () => {
+  it('服务恢复后重建已有运行域的可持久化续传 alarm', async () => {
+    const progress = createDefaultOrderProgress();
+    state = {
+      ...state,
+      orderProgress: {
+        ...progress,
+        lastRunAt: new Date().toISOString(),
+        domains: {
+          ...progress.domains,
+          statements: {
+            ...progress.domains.statements,
+            syncRunId: 'statement-run-1',
+            syncRunStatus: 'running',
+            lastProgressAt: new Date().toISOString(),
+            pending: 1,
+            pendingOrderIds: ['statement-1'],
+            resumeOrderId: 'statement-1',
+          },
+        },
+      },
+    };
+    let healthChecks = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      healthChecks += 1;
+      return new Response('', { status: healthChecks <= 2 ? 503 : 200 });
+    }));
+
+    await pollTtsErpHealth();
+    await pollTtsErpHealth();
+    await pollTtsErpHealth();
+
+    expect(alarms.get('order-data-sync:statements')?.delayInMinutes).toBe(0.1);
   });
 });
 

@@ -4798,6 +4798,10 @@ async function handleTtsErpHealthStateChange(
       'tts-erp 服务已恢复，订单同步将自动继续。', {
         ttsErpHealthy: true,
       });
+    // The alarm that discovered the outage has already been consumed. A
+    // previous domain run can also make the bootstrap gate a no-op, so the
+    // recovery path must explicitly rebuild durable continuation/main alarms.
+    await ensureBoundDomainAlarms('configuration_ready');
     // 恢复后立即触发一轮同步
     void maybeStartInitialOrderDomainSync('configuration_ready').catch(() => undefined);
   }
