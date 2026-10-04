@@ -154,6 +154,16 @@ describe('order domain concurrent scope changes', () => {
     expect(harness.state?.boundTab?.sellerId).toBe('seller-B');
   });
 
+  it('clears the binding outcome when the current Seller Center session expires', async () => {
+    vi.mocked(chrome.scripting.executeScript).mockResolvedValueOnce(pageResult({ code: 11000 }, 401) as never);
+
+    await handleOrderSyncAlarm();
+
+    expect(harness.state?.boundTab?.sellerId).toBeUndefined();
+    expect(harness.state?.sellerBinding).toEqual({ mode: 'idle', outcome: 'none', deadlineAt: null });
+    expect(harness.state?.shopRegion).toBeNull();
+  });
+
   it('keeps the alarm alive until its logistics consumer reaches a durable checkpoint', async () => {
     let resolveLogistics!: (result: ReturnType<typeof pageResult>) => void;
     vi.mocked(chrome.scripting.executeScript).mockImplementation(async (options) => {

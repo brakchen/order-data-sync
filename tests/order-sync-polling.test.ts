@@ -82,6 +82,7 @@ import { createDefaultOrderSyncState } from '../src/extension/storage';
 
 let state: OrderSyncState;
 let alarms: Map<string, { periodInMinutes?: number; delayInMinutes?: number }>;
+let missingTabIds: Set<number>;
 
 function boundState(overrides: Partial<OrderSyncState['settings']> = {}): OrderSyncState {
   const defaults = createDefaultOrderSyncState();
@@ -157,6 +158,7 @@ function withoutAdvertiser(): OrderSyncState {
 
 function chromeHarness(): void {
   alarms = new Map();
+  missingTabIds = new Set();
   vi.stubGlobal('chrome', {
     alarms: {
       get: vi.fn(async (name: string) => alarms.get(name)),
@@ -165,6 +167,7 @@ function chromeHarness(): void {
     },
     tabs: {
       get: vi.fn(async (tabId: number) => {
+        if (missingTabIds.has(tabId)) throw new Error('tab not found');
         if (state.boundTab?.tabId !== tabId) throw new Error('tab not found');
         return { id: tabId, url: state.boundTab.url };
       }),
@@ -204,6 +207,73 @@ afterEach(async () => {
   resetHealthState();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe('失效绑定 Tab 的自动接管', () => {
+  it('同域名新页面捕获身份时接管已关闭的旧绑定 Tab', async () => {
+    missingTabIds.add(7);
+
+    const next = await handleOrderMessage({
+      type: 'order-sync:capture-seller',
+      payload: {
+        sellerId: 'seller-new',
+        url: 'https://seller.tiktokglobalshop.com/orders',
+        shopName: 'New Shop',
+        shopRegion: 'VN',
+      },
+    }, { tab: { id: 8 } } as chrome.runtime.MessageSender) as OrderSyncState;
+
+    expect(next.boundTab).toMatchObject({
+      tabId: 8,
+      url: 'https://seller.tiktokglobalshop.com/orders',
+      sellerId: 'seller-new',
+      shopName: 'New Shop',
+      shopRegion: 'VN',
+      bindMode: 'auto',
+    });
+    expect(next.orderProgress).toEqual(state.orderProgress);
+    expect(state.runtimeLogs.some((log) => log.context?.event === 'seller_bound_tab_reassigned'
+      && log.context?.details?.previousTabId === 7
+      && log.context?.details?.replacementTabId === 8)).toBe(true);
+  });
+
+  it('绑定状态在捕获期间变化时忽略过期 Seller ID，不重建同步任务', async () => {
+    const unboundState: OrderSyncState = {
+      ...state,
+      boundTab: null,
+      sellerBinding: { mode: 'idle', outcome: 'none', deadlineAt: null },
+    };
+    mocks.getState
+      .mockResolvedValueOnce(state)
+      .mockResolvedValueOnce(unboundState);
+
+    const next = await handleOrderMessage({
+      type: 'order-sync:capture-seller',
+      payload: {
+        sellerId: 'stale-seller',
+        url: 'https://seller.tiktokglobalshop.com/orders',
+      },
+    }, { tab: { id: 8 } } as chrome.runtime.MessageSender) as OrderSyncState;
+
+    expect(next.boundTab).toBeNull();
+    expect(state.runtimeLogs.some((log) => log.context?.event === 'seller_identity_captured')).toBe(false);
+    expect(state.runtimeLogs.some((log) => log.context?.event === 'seller_identity_ignored'
+      && log.context?.details?.reason === 'binding_state_changed_during_capture')).toBe(true);
+    expect(alarms.size).toBe(0);
+  });
+
+  it('已连接时仍保留 Tab 健康监控，避免漏掉关闭事件后永久使用旧 Tab', async () => {
+    state = {
+      ...state,
+      orderProgress: { ...state.orderProgress, lastRunAt: new Date().toISOString() },
+    };
+    await handleOrderMessage({
+      type: 'order-sync:save-settings',
+      settings: state.settings,
+    }, {} as chrome.runtime.MessageSender);
+
+    expect(alarms.get('order-data-sync:seller-tab-watch')?.delayInMinutes).toBe(1);
+  });
 });
 
 describe('订单域 alarm 注册规则', () => {

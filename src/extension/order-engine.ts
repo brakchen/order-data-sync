@@ -184,6 +184,7 @@ async function clearOrderBinding(
     return {
       ...current,
       boundTab: boundTabWithoutSellerId,
+      sellerBinding: { mode: 'idle', outcome: 'none', deadlineAt: null },
       shopRegion: null,
     };
   });
