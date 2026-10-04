@@ -137,7 +137,7 @@ function Popup() {
               <em>{DOMAIN_DESCRIPTIONS[domain]}</em>
               <small>{domain === 'orders' ? `订单数 ${orderTotal(row)} · ` : ''}已上传 {row?.uploaded ?? 0} · 待处理 {row?.pending ?? 0} · 失败 {row?.failed ?? 0}</small>
               {row?.lastError ? <small className="error">{row.lastError}</small> : null}
-              {domain !== 'after_sales' && row?.syncRunStatus === 'running'
+              {row?.syncRunStatus === 'running'
                 && Date.now() - Date.parse(row.lastProgressAt ?? '') > 2 * 60_000
                 ? <button className="stop-button" disabled={busy}
                   onClick={() => void application.stopStuckDomain(domain, DOMAIN_LABELS[domain])}>

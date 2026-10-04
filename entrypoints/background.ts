@@ -70,6 +70,8 @@ export default defineBackground(() => {
       void pollOrderDomain('logistics').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.statements || alarm.name === ORDER_SYNC_ALARMS.statementsContinue) {
       void pollOrderDomain('statements').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
+    } else if (alarm.name === ORDER_SYNC_ALARMS.after_sales || alarm.name === ORDER_SYNC_ALARMS.afterSalesContinue) {
+      void pollOrderDomain('after_sales').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.order_details || alarm.name === ORDER_SYNC_ALARMS.orderDetailsContinue) {
       void pollOrderDomain('order_details').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.order_history || alarm.name === ORDER_SYNC_ALARMS.orderHistoryContinue) {

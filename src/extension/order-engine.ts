@@ -26,6 +26,13 @@ import {
   StatementTransactionDetailResponseSchema,
   type StatementSkuDetailRef,
 } from '../core/tiktok-statement-endpoint-schemas';
+import {
+  createAfterSalesSearchBody,
+  TIKTOK_AFTER_SALES_ENDPOINT_PATH,
+  TIKTOK_AFTER_SALES_API_ORIGIN,
+  tiktokAfterSalesEndpointUrl,
+} from '../core/tiktok-after-sales-endpoints';
+import { AfterSalesSearchResponseSchema } from '../core/tiktok-after-sales-endpoint-schemas';
 import { createAdaptivePageLoadGuard } from '../core/adaptive-page-load-guard';
 import { createRequestRateLimiter } from '../core/request-rate-limiter';
 import { normalizeOrderSyncBaseUrl } from '../core/settings';
@@ -65,11 +72,13 @@ export const ORDER_SYNC_ALARMS = {
   orders: 'order-data-sync:orders',
   logistics: 'order-data-sync:logistics',
   statements: 'order-data-sync:statements',
+  after_sales: 'order-data-sync:after-sales',
   order_details: 'order-data-sync:order-details',
   order_history: 'order-data-sync:order-history',
   ordersContinue: 'order-data-sync:orders:continue',
   logisticsContinue: 'order-data-sync:logistics:continue',
   statementsContinue: 'order-data-sync:statements:continue',
+  afterSalesContinue: 'order-data-sync:after-sales:continue',
   orderDetailsContinue: 'order-data-sync:order-details:continue',
   orderHistoryContinue: 'order-data-sync:order-history:continue',
   erpHealth: 'order-data-sync:erp-health',
@@ -252,6 +261,12 @@ const ORDER_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.ordersContinue;
 
 const SETTLEMENT_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.statementsContinue;
 
+const AFTER_SALES_SYNC_ALARM = ORDER_SYNC_ALARMS.after_sales;
+
+const AFTER_SALES_SYNC_NEXT_DELAY_MINUTES = 24 * 60;
+
+const AFTER_SALES_CONTINUATION_ALARM = ORDER_SYNC_ALARMS.afterSalesContinue;
+
 const ORDER_DETAILS_SYNC_ALARM = ORDER_SYNC_ALARMS.order_details;
 
 const ORDER_DETAILS_SYNC_NEXT_DELAY_MINUTES = 24 * 60;
@@ -291,9 +306,13 @@ const MAX_ORDER_HISTORY_PAGES = 500;
 
 const STATEMENT_LIST_PAGE_SIZE = 50;
 
+const AFTER_SALES_PAGE_SIZE = 50;
+
 const MAX_ORDER_LIST_PAGES = 500;
 
 const MAX_STATEMENT_LIST_PAGES = 500;
+
+const MAX_AFTER_SALES_PAGES = 500;
 
 const ORDER_RECONCILE_HOT_WINDOW_SIZE = 40;
 
@@ -1381,6 +1400,7 @@ class StopOrderDomainBatch extends Error {
 function continuationAlarmForOrderDomain(domain: OrderPollingDomain): string {
   if (domain === 'orders') return ORDER_CONTINUATION_ALARM;
   if (domain === 'logistics') return LOGISTICS_CONTINUATION_ALARM;
+  if (domain === 'after_sales') return AFTER_SALES_CONTINUATION_ALARM;
   if (domain === 'order_details') return ORDER_DETAILS_CONTINUATION_ALARM;
   if (domain === 'order_history') return ORDER_HISTORY_CONTINUATION_ALARM;
   return SETTLEMENT_CONTINUATION_ALARM;
@@ -1394,6 +1414,7 @@ async function deferOrderDomainAlarm(domain: OrderPollingDomain): Promise<void> 
   if (continuation) return;
   const alarm = domain === 'orders' ? ORDER_SYNC_ALARM
     : domain === 'logistics' ? LOGISTICS_SYNC_ALARM
+    : domain === 'after_sales' ? AFTER_SALES_SYNC_ALARM
     : domain === 'order_details' ? ORDER_DETAILS_SYNC_ALARM
     : domain === 'order_history' ? ORDER_HISTORY_SYNC_ALARM
     : SETTLEMENT_SYNC_ALARM;
@@ -1404,6 +1425,7 @@ async function deferOrderDomainAlarm(domain: OrderPollingDomain): Promise<void> 
 function cycleDelayForOrderDomain(domain: OrderPollingDomain): number {
   if (domain === 'orders') return ORDER_SYNC_NEXT_DELAY_MINUTES;
   if (domain === 'logistics') return LOGISTICS_SYNC_NEXT_DELAY_MINUTES;
+  if (domain === 'after_sales') return AFTER_SALES_SYNC_NEXT_DELAY_MINUTES;
   if (domain === 'order_details') return ORDER_DETAILS_SYNC_NEXT_DELAY_MINUTES;
   if (domain === 'order_history') return ORDER_HISTORY_SYNC_NEXT_DELAY_MINUTES;
   return SETTLEMENT_SYNC_NEXT_DELAY_MINUTES;
@@ -1456,6 +1478,10 @@ async function scheduleNextOrderDomainRound(domain: OrderPollingDomain): Promise
     await chrome.alarms.create(ORDER_DETAILS_SYNC_ALARM, {
       delayInMinutes: cycleDelayForOrderDomain(domain),
     });
+  } else if (domain === 'after_sales') {
+    await chrome.alarms.create(AFTER_SALES_SYNC_ALARM, {
+      delayInMinutes: cycleDelayForOrderDomain(domain),
+    });
   } else if (domain === 'order_history') {
     await chrome.alarms.create(ORDER_HISTORY_SYNC_ALARM, {
       delayInMinutes: cycleDelayForOrderDomain(domain),
@@ -1499,6 +1525,10 @@ async function scheduleOrderDomainContinuation(
     });
   } else if (domain === 'order_history') {
     await chrome.alarms.create(ORDER_HISTORY_CONTINUATION_ALARM, {
+      delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES,
+    });
+  } else if (domain === 'after_sales') {
+    await chrome.alarms.create(AFTER_SALES_CONTINUATION_ALARM, {
       delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES,
     });
   } else {
@@ -2871,6 +2901,14 @@ type StatementPollingRow = {
   status: number;
 };
 
+type AfterSalesPollingRow = {
+  cancellationId: string;
+  row: Record<string, unknown>;
+  endpoint: string;
+  requestBody: Record<string, unknown>;
+  status: number;
+};
+
 
 /** Settlement is a global statement list; it is not keyed by main_order_id. */
 async function fetchStatementRows(state: OrderSyncState): Promise<StatementPollingRow[]> {
@@ -3037,6 +3075,169 @@ async function fetchStatementRows(state: OrderSyncState): Promise<StatementPolli
     from += data.statement_records.length;
   }
   if (hasMore) throw new Error('结算列表分页超过安全上限。');
+  return rows;
+}
+
+/** After-sales is a global paged feed; one cancellation is uploaded per dump. */
+async function fetchAfterSalesRows(state: OrderSyncState): Promise<AfterSalesPollingRow[]> {
+  const boundTab = state.boundTab!;
+  const origin = TIKTOK_AFTER_SALES_API_ORIGIN;
+  const identity = { sellerId: boundTab.sellerId!, region: orderShopRegion(state)! };
+  const rows: AfterSalesPollingRow[] = [];
+  let offset = 0;
+  let searchCursor = '';
+  let totalCount: number | null = null;
+  await recordOrderProgress('after_sales', {
+    listPhase: 'list_fetching',
+    listPage: 1,
+    listPageCount: null,
+    listRowsFetched: 0,
+    listTotalRows: null,
+  }, 'running', state, '售后列表读取开始。', {
+    action: 'list_fetch_started',
+    endpoint: TIKTOK_AFTER_SALES_ENDPOINT_PATH,
+    page: 1,
+  });
+  for (let page = 0; page < MAX_AFTER_SALES_PAGES; page += 1) {
+    if (!await isOrderSyncScopeCurrent(state) || !isOrderDomainRunCurrent('after_sales', state)) {
+      throw new StopOrderDomainBatch('订单同步作用域已变化，停止继续读取售后列表。');
+    }
+    const requestBody = createAfterSalesSearchBody({
+      offset,
+      count: AFTER_SALES_PAGE_SIZE,
+      searchCursor,
+    });
+    const url = tiktokAfterSalesEndpointUrl(origin, identity);
+    const requestStartedAt = Date.now();
+    let result: BoundTikTokResponse;
+    try {
+      result = await executeTikTokRequestWithTimeout(
+        boundTab.tabId,
+        url,
+        requestBody,
+        'POST',
+        ORDER_ITEM_REQUEST_TIMEOUT_MS,
+      );
+    } catch (error) {
+      await recordOrderSyncRuntimeLog('after_sales', 'tiktok_request', 'failed', '售后列表请求异常。', {
+        stage: 'after_sales_list',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(url),
+        page: page + 1,
+        offset,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', url, requestBody),
+        ...orderRequestExceptionDetails(error),
+      });
+      throw error;
+    }
+    if (!result.ok) {
+      await recordOrderSyncRuntimeLog('after_sales', 'tiktok_request', 'failed', '售后列表响应失败。', {
+        stage: 'after_sales_list',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(url),
+        page: page + 1,
+        offset,
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', url, requestBody, result),
+        ...orderTikTokResponseDiagnostics(result),
+      });
+      if (isTikTokAuthenticationFailure(result)) await clearOrderBinding(state, 'after_sales_authentication_failed');
+      throw new Error(orderTikTokFailureSummary('售后列表请求失败', result));
+    }
+    if (isTikTokAuthenticationFailure(result)) {
+      await clearOrderBinding(state, 'after_sales_authentication_failed');
+      throw new Error('售后列表请求需要重新登录。');
+    }
+    const parsed = AfterSalesSearchResponseSchema.safeParse(result.payload);
+    if (!parsed.success) {
+      await recordOrderSyncRuntimeLog('after_sales', 'tiktok_request', 'failed', '售后列表响应格式无效。', {
+        stage: 'after_sales_list',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(url),
+        page: page + 1,
+        offset,
+        failureReason: 'schema_invalid',
+        schemaError: sanitizeDiagnosticText(parsed.error.message).slice(0, 240),
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', url, requestBody, result),
+        ...orderTikTokResponseDiagnostics(result),
+      });
+      throw new Error('售后列表响应格式无效');
+    }
+    if (parsed.data.code !== 0) {
+      await recordOrderSyncRuntimeLog('after_sales', 'tiktok_request', 'failed', '售后列表业务响应失败。', {
+        stage: 'after_sales_list',
+        method: 'POST',
+        endpoint: orderTikTokEndpointPath(url),
+        page: page + 1,
+        offset,
+        failureReason: 'business_code',
+        businessCode: parsed.data.code,
+        businessMessage: sanitizeDiagnosticText(parsed.data.message ?? '').slice(0, 160),
+        durationMs: Math.max(0, Date.now() - requestStartedAt),
+        ...orderTikTokRuntimeExchange('POST', url, requestBody, result),
+        ...orderTikTokResponseDiagnostics(result),
+      });
+      throw new Error(`售后列表业务响应失败：code=${parsed.data.code}`);
+    }
+    const data = parsed.data.data;
+    const pageRows = data.cancellations;
+    const parsedTotal = Number(data.total_count);
+    totalCount = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : totalCount;
+    const pageCount = totalCount !== null && totalCount > 0
+      ? Math.max(1, Math.ceil(totalCount / AFTER_SALES_PAGE_SIZE))
+      : null;
+    await recordOrderSyncRuntimeLog('after_sales', 'tiktok_request', 'succeeded', '售后列表响应已解析。', {
+      stage: 'after_sales_list',
+      method: 'POST',
+      endpoint: orderTikTokEndpointPath(url),
+      page: page + 1,
+      offset,
+      rowCount: pageRows.length,
+      totalRecord: totalCount,
+      hasMore: data.search_next_has_more === true || data.has_more === true
+        || Boolean(data.search_next_cursor || data.next_page_token),
+      durationMs: Math.max(0, Date.now() - requestStartedAt),
+      ...orderTikTokRuntimeExchange('POST', url, requestBody, result),
+      ...orderTikTokResponseDiagnostics(result),
+    });
+    for (const [index, cancellation] of pageRows.entries()) {
+      const row = cancellation as Record<string, unknown>;
+      const rawId = row.cancel_id ?? row.main_order_id;
+      rows.push({
+        cancellationId: typeof rawId === 'string' || typeof rawId === 'number'
+          ? String(rawId) : `page-${page + 1}-row-${index + 1}`,
+        row,
+        endpoint: url,
+        requestBody,
+        status: result.status,
+      });
+    }
+    await recordOrderProgress('after_sales', {
+      listPhase: 'list_fetching',
+      listPage: page + 1,
+      listPageCount: pageCount,
+      listRowsFetched: rows.length,
+      listTotalRows: totalCount,
+    }, 'running', state, `正在读取售后列表：第 ${page + 1} 页${pageCount ? ` / 约 ${pageCount} 页` : ''}。`, {
+      action: 'list_page_fetched',
+      page: page + 1,
+      pageCount,
+      fetchedRows: rows.length,
+      totalRows: totalCount,
+    });
+    const nextCursor = data.search_next_cursor ?? data.next_page_token ?? '';
+    const nextHasMore = data.search_next_has_more === true || data.has_more === true
+      || Boolean(nextCursor)
+      || (totalCount !== null && rows.length < totalCount);
+    if (!nextHasMore || pageRows.length === 0) break;
+    if (nextCursor && nextCursor === searchCursor) {
+      throw new Error('售后列表分页游标没有推进。');
+    }
+    searchCursor = nextCursor;
+    offset += pageRows.length;
+  }
   return rows;
 }
 
@@ -4030,7 +4231,7 @@ export async function pollOrderDomain(
 
 async function launchManualOrderDomainSync(retryFailedOnly: boolean): Promise<void> {
   const state = await orderSyncStateStore.read();
-  const ALL_MANUAL_DOMAINS: OrderPollingDomain[] = ['orders', 'logistics', 'statements', 'order_details', 'order_history'];
+  const ALL_MANUAL_DOMAINS: OrderPollingDomain[] = ['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history'];
   const domains: OrderPollingDomain[] = retryFailedOnly
     ? ALL_MANUAL_DOMAINS.filter((domain) => {
       const row = state.orderProgress?.domains[domain];
@@ -4061,6 +4262,7 @@ async function launchManualOrderDomainSync(retryFailedOnly: boolean): Promise<vo
   if (domains.includes('order_details')) await pollOrderDomain('order_details', 'manual');
   if (domains.includes('order_history')) await pollOrderDomain('order_history', 'manual');
   if (domains.includes('statements')) await pollOrderDomain('statements', 'manual');
+  if (domains.includes('after_sales')) await pollOrderDomain('after_sales', 'manual');
 }
 
 
@@ -4072,7 +4274,7 @@ export async function requestManualOrderDomainSync(retryFailedOnly: boolean): Pr
   if (!orderShopRegion(current)) {
     throw new Error('店铺地区未配置，无法开始订单同步。请先在 Seller Center 或 TTS-ERP 店铺账号中填写地区代码。');
   }
-  const running = (['orders', 'logistics', 'statements', 'order_details', 'order_history'] as const).filter((domain) =>
+  const running = (['orders', 'logistics', 'statements', 'after_sales', 'order_details', 'order_history'] as const).filter((domain) =>
     current.orderProgress?.domains[domain]?.syncRunStatus === 'running',
   );
   if (running.some((domain) => !orderDomainIsStuck(current.orderProgress?.domains[domain]))) {
@@ -4125,7 +4327,7 @@ export async function stopStuckOrderDomainAndRetry(domain: OrderDomainKey): Prom
       };
     });
     orderRunCoordinator.stopRun(oldRunId);
-    const mainAlarm = domain === 'orders' ? ORDER_SYNC_ALARM : domain === 'logistics' ? LOGISTICS_SYNC_ALARM : domain === 'order_details' ? ORDER_DETAILS_SYNC_ALARM : domain === 'order_history' ? ORDER_HISTORY_SYNC_ALARM : SETTLEMENT_SYNC_ALARM;
+    const mainAlarm = domain === 'orders' ? ORDER_SYNC_ALARM : domain === 'logistics' ? LOGISTICS_SYNC_ALARM : domain === 'after_sales' ? AFTER_SALES_SYNC_ALARM : domain === 'order_details' ? ORDER_DETAILS_SYNC_ALARM : domain === 'order_history' ? ORDER_HISTORY_SYNC_ALARM : SETTLEMENT_SYNC_ALARM;
     if (typeof chrome.alarms.clear === 'function') {
       await chrome.alarms.clear(mainAlarm);
       await chrome.alarms.clear(continuationAlarmForOrderDomain(domain));
@@ -4155,13 +4357,17 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
   const boundTab = state.boundTab!;
   const origin = domain === 'statements'
     ? TIKTOK_STATEMENT_API_ORIGIN
-    : boundSellerCenterOrigin(boundTab.url);
+    : domain === 'after_sales'
+      ? TIKTOK_AFTER_SALES_API_ORIGIN
+      : boundSellerCenterOrigin(boundTab.url);
 
   let statementRows: StatementPollingRow[] | null = null;
+  let afterSalesRows: AfterSalesPollingRow[] | null = null;
   let orderRows: OrderListRow[] | null = null;
   let logisticsSelection: LogisticsRoundSelection | null = null;
   try {
     statementRows = domain === 'statements' ? await fetchStatementRows(state) : null;
+    afterSalesRows = domain === 'after_sales' ? await fetchAfterSalesRows(state) : null;
     if (domain === 'logistics') {
       logisticsSelection = await fetchLogisticsRowsForRound(state, settings, scope);
       orderRows = logisticsSelection?.rows ?? (await fetchOrderListRows(state, 'logistics')).rows;
@@ -4195,7 +4401,7 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
     await scheduleOrderDomainRetryAfterListFailure(domain, state);
     return;
   }
-  const rows = statementRows ?? orderRows ?? [];
+  const rows = statementRows ?? afterSalesRows ?? orderRows ?? [];
   if (domain === 'logistics' && logisticsSelection) {
     await recordOrderProgress('logistics', {
       syncStrategy: logisticsSelection.strategy,
@@ -4230,6 +4436,28 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
         [],
         logisticsSelection.terminalSkipped,
       );
+      return;
+    }
+    if (domain === 'after_sales') {
+      await recordOrderProgress('after_sales', {
+        total: 0,
+        covered: 0,
+        uploaded: 0,
+        pending: 0,
+        failed: 0,
+        currentOrderId: null,
+        currentOrderIndex: null,
+        resumeOrderId: null,
+        failedOrderIds: [],
+        pendingOrderIds: [],
+        snapshotKeys: [],
+        lastError: null,
+        ...resetOrderListProgress(),
+      }, 'ok', state, '售后列表返回 0 条，已记录为本轮成功并安排下一次同步。', {
+        action: 'list_empty_success',
+        endpoint: TIKTOK_AFTER_SALES_ENDPOINT_PATH,
+      });
+      await scheduleNextOrderDomainRound('after_sales');
       return;
     }
     const message = `${domain} 域轮询返回 0 行：bound-page ${statementRows ? 'statement/list' : 'order/list'} 解析为空（schema 校验失败 / TikTok 返回空 / 解析异常）。`;
@@ -4273,6 +4501,37 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
       origin,
       orderRows!,
       0,
+    );
+    return;
+  }
+  if (domain === 'after_sales') {
+    const pendingRows = afterSalesRows!;
+    const capturedAt = new Date().toISOString();
+    await processOrderDomainBatch(
+      state,
+      'after_sales',
+      pendingRows.map((entry, index) => ({
+        key: entry.cancellationId,
+        displayId: entry.cancellationId,
+        index: index + 1,
+        process: async () => {
+          const payload = isRecord(entry.row) ? entry.row : {};
+          await uploadOrderSyncDumpGuarded(settings, scope, createOrderSyncDump({
+            domain: 'after_sales',
+            endpoint: entry.endpoint,
+            method: 'POST',
+            request: { body: entry.requestBody },
+            response: {
+              status: entry.status,
+              body: { code: 0, message: 'success', data: { cancellations: [payload] } },
+            },
+            createdAt: capturedAt,
+          }));
+        },
+      })),
+      0,
+      0,
+      null,
     );
     return;
   }
@@ -4488,6 +4747,7 @@ export async function ensureBoundDomainAlarms(
   await ensureOrderSyncAlarm();
   await ensureLogisticsSyncAlarm();
   await ensureSettlementSyncAlarm();
+  await ensureAfterSalesSyncAlarm();
   await ensureOrderDetailsSyncAlarm();
   await ensureOrderHistorySyncAlarm();
   void maybeStartInitialOrderDomainSync(initialSyncTrigger).catch(() => undefined);
@@ -4583,13 +4843,14 @@ export async function runInitialOrderDomainSync(
     // incremental paths without a page producer need standalone discovery.
     if (!orderPagePipelineUsed) await pollOrderDomain('logistics');
     await pollOrderDomain('statements');
+    await pollOrderDomain('after_sales');
     // order_details 和 order_history 由 pipeline 自动入队；若 pipeline 未启动则手动触发。
     if (!orderPagePipelineUsed) {
       await pollOrderDomain('order_details');
       await pollOrderDomain('order_history');
     }
     const current = await orderSyncStateStore.read();
-    const pendingDomains = (['orders', 'logistics', 'statements'] as const)
+    const pendingDomains = (['orders', 'logistics', 'statements', 'after_sales'] as const)
       .filter((domain) => !isOrderDomainRoundSettled(current.orderProgress?.domains[domain]));
     // order_details 和 order_history 由 pipeline 自动入队，不在首次同步的 pending 域列表中报告。
     await recordOrderSyncRuntimeLog(
@@ -4667,6 +4928,11 @@ export async function ensureSettlementSyncAlarm(): Promise<void> {
 }
 
 
+export async function ensureAfterSalesSyncAlarm(): Promise<void> {
+  await ensureBoundAlarm(AFTER_SALES_SYNC_ALARM, AFTER_SALES_SYNC_NEXT_DELAY_MINUTES, 'after_sales');
+}
+
+
 /** 订单域三个 alarm 都是一次性 alarm：没绑定就清掉，否则确保下一轮存在。 */
 async function ensureBoundAlarm(
   name: string,
@@ -4704,6 +4970,23 @@ async function ensureBoundAlarm(
   if (hasCheckpoint) {
     if (existing && typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(name);
     await chrome.alarms.create(name, { delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES });
+    return;
+  }
+  // A previous version used orderProgress.lastRunAt as the bootstrap gate.
+  // That value is shared by every domain, so an order run could leave
+  // statements/after-sales permanently idle while their alarm was scheduled
+  // 24 hours later. Bootstrap each global feed from its own success state.
+  const needsDomainBootstrap = (domain === 'statements' || domain === 'after_sales')
+    && row?.syncRunStatus === 'idle'
+    && !row?.lastSuccessAt;
+  if (needsDomainBootstrap) {
+    const scheduledSoon = existing
+      && Number.isFinite(existing.scheduledTime)
+      && existing.scheduledTime <= Date.now() + 2 * 60_000;
+    if (!scheduledSoon) {
+      if (existing && typeof chrome.alarms.clear === 'function') await chrome.alarms.clear(name);
+      await chrome.alarms.create(name, { delayInMinutes: ORDER_DOMAIN_CONTINUATION_DELAY_MINUTES });
+    }
     return;
   }
   const nextSyncAt = Date.parse(row?.nextSyncAt ?? '');

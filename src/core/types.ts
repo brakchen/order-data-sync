@@ -1,7 +1,7 @@
 /** Domain-owned state for the standalone order extension. */
-export type OrderDomainKey = 'orders' | 'logistics' | 'statements' | 'order_details' | 'order_history';
-/** Domains that can be shown in the popup, including the protocol-ready after-sales domain. */
-export type OrderDisplayDomainKey = OrderDomainKey | 'after_sales';
+export type OrderDomainKey = 'orders' | 'logistics' | 'statements' | 'after_sales' | 'order_details' | 'order_history';
+/** Domains that can be shown in the popup. */
+export type OrderDisplayDomainKey = OrderDomainKey;
 export type OrderSyncTrigger = 'automatic' | 'manual';
 export type OrderDomainRunStatus = 'idle' | 'running' | 'done' | 'partial_failed' | 'interrupted';
 export type OrderDomainListPhase = 'idle' | 'list_fetching' | 'processing';
@@ -61,9 +61,7 @@ export interface OrderDomainProgressRow {
 export interface OrderDomainProgress {
   status: 'idle' | 'running' | 'ok' | 'partial';
   lastRunAt: string | null;
-  domains: Record<OrderDomainKey, OrderDomainProgressRow> & {
-    after_sales: OrderDomainProgressRow;
-  };
+  domains: Record<OrderDomainKey, OrderDomainProgressRow>;
 }
 
 /** Credentials and pause controls belong only to this extension. */

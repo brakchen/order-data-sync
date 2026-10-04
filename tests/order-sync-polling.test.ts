@@ -2199,6 +2199,47 @@ describe('结算域（全局列表）', () => {
   });
 });
 
+describe('售后域（全局取消单列表）', () => {
+  it('主动请求 cancellations/search 并按售后域上传', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      message: 'success',
+      data: {
+        total_count: 1,
+        search_next_has_more: false,
+        cancellations: [{
+          cancel_id: 'cancel-1',
+          order_id: 'order-1',
+          cancel_line_items: [],
+        }],
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+
+    await pollOrderDomain('after_sales');
+
+    const upload = mocks.uploadDump.mock.calls
+      .map((call) => call[2] as { domain?: string; response?: { body?: Record<string, unknown> } })
+      .find((dump) => dump.domain === 'after_sales');
+    expect(upload?.domain).toBe('after_sales');
+    expect(upload?.response?.body).toMatchObject({
+      data: { cancellations: [{ cancel_id: 'cancel-1' }] },
+    });
+    const requestCall = (chrome.scripting.executeScript as ReturnType<typeof vi.fn>).mock.calls
+      .find((call) => String(call[0]?.args?.[0]).includes('/return_refund/202309/cancellations/search'));
+    expect(requestCall?.[0]?.args?.[1]).toMatchObject({
+      count: 50,
+      offset: 0,
+      pagination_type: 0,
+      search_cursor: '',
+    });
+    expect(state.orderProgress.domains.after_sales).toMatchObject({
+      uploaded: 1,
+      pending: 0,
+      syncRunStatus: 'done',
+    });
+  });
+});
+
 describe('配置完成后的订单域首次主动同步', () => {
   it('保存最后一项同步配置后立即启动三域首次同步', async () => {
     state = boundState({ syncToken: '' });
@@ -2218,7 +2259,10 @@ describe('配置完成后的订单域首次主动同步', () => {
       && log.context?.details?.trigger === 'configuration_ready')).toBe(true);
     expect(alarms.get('order-data-sync:orders')?.delayInMinutes).toBe(1440);
     expect(alarms.get('order-data-sync:logistics')?.delayInMinutes).toBe(1440);
-    expect(alarms.get('order-data-sync:statements')?.delayInMinutes).toBe(1440);
+    // Global feeds are bootstrapped independently; an existing order run must
+    // not defer their first pull for a full day.
+    expect(alarms.get('order-data-sync:statements')?.delayInMinutes).toBe(0.1);
+    expect(alarms.get('order-data-sync:after-sales')?.delayInMinutes).toBe(0.1);
   });
 
   it('首批未处理完时只标记已排队，不把首次同步写成完成', async () => {
