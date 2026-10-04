@@ -74,7 +74,7 @@ function Popup() {
     <main className="shell">
       <header className="header">
         <div className="mark"><img src="/icons/icon-128.png" alt="" /></div>
-        <div><p className="eyebrow">TIKTOK SHOP</p><h1>订单数据同步</h1></div>
+        <div><p className="eyebrow">TIKTOK SHOP</p><h1>TK订单数据同步</h1></div>
         <div className={`health-indicator ${state?.ttsErpHealth?.healthy === false ? 'health-down' : 'health-up'}`}>
           <span className="health-dot" />
           <span>{state?.ttsErpHealth?.healthy === false ? 'tts-erp 离线' : 'tts-erp 在线'}</span>
