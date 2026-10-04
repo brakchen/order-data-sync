@@ -1859,7 +1859,7 @@ describe('结算域（全局列表）', () => {
     expect(state.orderProgress?.domains.statements.lastError).toContain('结算列表业务响应失败');
   });
 
-  it('结算 coverage 查询按后端 500 ID 上限分片，但不截断刷新', async () => {
+  it('结算明细查询按后端 500 ID 上限分片，但不截断刷新', async () => {
     const records = Array.from({ length: 501 }, (_, index) => ({
       statement_id: `st-${index}`,
       statement_version: 1,

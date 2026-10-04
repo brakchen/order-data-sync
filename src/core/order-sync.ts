@@ -1,7 +1,7 @@
 /**
  * Order-sync protocol client for tts-erp /v2/order-sync/* endpoints.
  *
- * Follows the same architecture as analytics-sync-v2 (dump upload + coverage
+ * Follows the same architecture as analytics-sync-v2 (dump upload + reconcile
  * check), but for order/logistics/statement domains from the Chrome extension
  * Seller Center page captures.
  *
@@ -316,6 +316,7 @@ export async function fetchOrderSyncReconciliation(
   reconcileRequest: Omit<OrderSyncReconcileRequest, 'protocolVersion' | 'scope'>,
   options: {
     fetchImpl?: FetchLike;
+    sleep?: Sleep;
     signal?: AbortSignal;
     requestId?: string;
   } = {},
@@ -325,6 +326,7 @@ export async function fetchOrderSyncReconciliation(
     throw new OrderSyncError('PERMANENT', '同步令牌未配置', undefined, undefined, 'reconcile');
   }
   const fetchImpl = options.fetchImpl ?? defaultFetch;
+  const sleep = options.sleep ?? abortableDelay;
   const requestId = options.requestId ?? crypto.randomUUID();
 
   const payload: OrderSyncReconcileRequest = {
@@ -337,38 +339,68 @@ export async function fetchOrderSyncReconciliation(
   const url = new URL('v2/order-sync/reconcile', normaliseBaseUrl(settings.syncBaseUrl));
   const requestStartedAt = Date.now();
 
-  let response: Response;
-  try {
-    response = await request(fetchImpl, url, {
-      method: 'POST',
-      headers: {
-        ...scopeHeaders(settings),
-        'x-protocol-version': String(ORDER_SYNC_PROTOCOL_VERSION),
-        'x-request-id': requestId,
-      },
-      body: JSON.stringify(payload),
-      ...(options.signal ? { signal: options.signal } : {}),
-    });
-  } catch (error) {
-    if (isAborted(options.signal, error)) throw abortError();
-    const syncError = new OrderSyncError(
-      'NETWORK', undefined, undefined, undefined, 'reconcile', transportFailureKind(error),
-    );
-    throw withRequestDiagnostics(syncError, url, requestId, 1, requestStartedAt, requestStartedAt, error);
+  let lastAttemptStartedAt = requestStartedAt;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    lastAttemptStartedAt = Date.now();
+    let response: Response;
+    try {
+      response = await request(fetchImpl, url, {
+        method: 'POST',
+        headers: {
+          ...scopeHeaders(settings),
+          'x-protocol-version': String(ORDER_SYNC_PROTOCOL_VERSION),
+          'x-request-id': requestId,
+        },
+        body: JSON.stringify(payload),
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch (error) {
+      if (isAborted(options.signal, error)) throw abortError();
+      if (attempt + 1 === 3) {
+        const syncError = new OrderSyncError(
+          'NETWORK', undefined, undefined, undefined, 'reconcile', transportFailureKind(error),
+        );
+        const rootError = error instanceof OrderSyncTransportError ? error.originalError ?? error : error;
+        throw withRequestDiagnostics(
+          syncError, url, requestId, attempt + 1, requestStartedAt, lastAttemptStartedAt, rootError,
+        );
+      }
+      await sleepWithAbort(sleep, retryDelay(attempt), options.signal);
+      continue;
+    }
+
+    if (response.status === 429 || response.status >= 500) {
+      if (options.signal?.aborted) throw abortError();
+      if (attempt + 1 === 3) {
+        const syncError = await responseError(response, 'reconcile');
+        throw withRequestDiagnostics(
+          syncError, url, requestId, attempt + 1, requestStartedAt, lastAttemptStartedAt,
+        );
+      }
+      await sleepWithAbort(
+        sleep,
+        response.status === 429 ? retryAfterMilliseconds(response.headers.get('retry-after')) : retryDelay(attempt),
+        options.signal,
+      );
+      continue;
+    }
+
+    if (!response.ok) {
+      const syncError = await responseError(response, 'reconcile');
+      throw withRequestDiagnostics(syncError, url, requestId, attempt + 1, requestStartedAt, lastAttemptStartedAt);
+    }
+    try {
+      return parseReconcileResponse(await response.json());
+    } catch (error) {
+      if (error instanceof OrderSyncError) {
+        throw withRequestDiagnostics(error, url, requestId, attempt + 1, requestStartedAt, lastAttemptStartedAt);
+      }
+      throw error;
+    }
   }
 
-  if (!response.ok) {
-    const syncError = await responseError(response, 'reconcile');
-    throw withRequestDiagnostics(syncError, url, requestId, 1, requestStartedAt, requestStartedAt);
-  }
-  try {
-    return parseReconcileResponse(await response.json());
-  } catch (error) {
-    if (error instanceof OrderSyncError) {
-      throw withRequestDiagnostics(error, url, requestId, 1, requestStartedAt, requestStartedAt);
-    }
-    throw error;
-  }
+  const syncError = new OrderSyncError('RETRYABLE', undefined, undefined, undefined, 'reconcile');
+  throw withRequestDiagnostics(syncError, url, requestId, 3, requestStartedAt, lastAttemptStartedAt);
 }
 
 function parseReconcileResponse(value: unknown): OrderSyncReconcileResult {

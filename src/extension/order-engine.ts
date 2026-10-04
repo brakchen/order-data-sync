@@ -32,10 +32,9 @@ import { normalizeOrderSyncBaseUrl } from '../core/settings';
 import {
   checkTtsErpHealth,
   getTtsErpHealthState,
+  isHealthCheckDue,
   isTtsErpHealthy,
   resetHealthState,
-  startHealthPolling,
-  stopHealthPolling,
   type TtsErpHealthState,
 } from '../core/tts-erp-health';
 import type {
@@ -73,6 +72,7 @@ export const ORDER_SYNC_ALARMS = {
   statementsContinue: 'order-data-sync:statements:continue',
   orderDetailsContinue: 'order-data-sync:order-details:continue',
   orderHistoryContinue: 'order-data-sync:order-history:continue',
+  erpHealth: 'order-data-sync:erp-health',
 } as const;
 export const SELLER_TAB_ALARMS = {
   refresh: 'order-data-sync:seller-tab-refresh',
@@ -197,8 +197,6 @@ async function clearOrderBinding(
   await chrome.alarms.create(SELLER_TAB_ALARMS.watch, {
     delayInMinutes: SELLER_TAB_WATCH_DELAY_MINUTES,
   });
-  // 停止探活轮询
-  stopTtsErpHealthPolling();
   await recordOrderSyncRuntimeLog('all', 'seller_binding_auth_expired', 'skipped', 'Seller Center 会话已失效，已停止同步并保留断点，等待重新登录或同域名页面接管。', {
     stage: 'seller_binding',
     reason,
@@ -521,6 +519,10 @@ async function orderPollingState(): Promise<OrderSyncState | null> {
   if (state.settings.syncPaused === true) return null;
   // 0.1.149+：移除 autoPausedReason 全局熔断。needsHuman 是 per-unit，dumpWork 自然跳过。
   if (!isOrderDomainSyncEnabled(state.settings)) return null;
+  // MV3 service worker 可能在两次 alarm 之间被挂起；因此不能只依赖
+  // 内存中的定时器状态。真正开始同步前，按缓存 TTL 做一次探活。
+  const healthAlarm = await chrome.alarms.get(ORDER_SYNC_ALARMS.erpHealth).catch(() => undefined);
+  if (healthAlarm && isHealthCheckDue()) await checkTtsErpHealth(state.settings.syncBaseUrl);
   // tts-erp 探活门控：/healthz 不可达时暂停所有同步，等待恢复。
   if (!isTtsErpHealthy()) return null;
   return state;
@@ -4273,9 +4275,10 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
     );
     return;
   }
-  // All order-domain rows are refreshed every round. Existence-only coverage
-  // cannot detect mutable settlement corrections; the backend natural-key
-  // upserts provide idempotency. The batch processor persists the cursor.
+  // All order-domain rows are refreshed every round. An existence-only
+  // reconcile result cannot detect mutable settlement corrections; the
+  // backend natural-key upserts provide idempotency. The batch processor
+  // persists the cursor.
   const pendingRows = statementRows!;
   const capturedAt = new Date().toISOString();
   await processOrderDomainBatch(
@@ -4480,29 +4483,43 @@ async function pollOrderDomainOnce(domain: Exclude<OrderPollingDomain, 'orders'>
 export async function ensureBoundDomainAlarms(
   initialSyncTrigger: InitialOrderSyncTrigger = 'extension_startup',
 ): Promise<void> {
+  await ensureTtsErpHealthAlarm();
   await ensureOrderSyncAlarm();
   await ensureLogisticsSyncAlarm();
   await ensureSettlementSyncAlarm();
   await ensureOrderDetailsSyncAlarm();
   await ensureOrderHistorySyncAlarm();
-  // 启动 3 秒探活轮询（setInterval，非 chrome.alarms）
-  startHealthPolling(
-    async () => {
-      const state = await orderSyncStateStore.read();
-      return state.settings.syncBaseUrl?.trim() || undefined;
-    },
-    (healthy, healthState) => {
-      void handleTtsErpHealthStateChange(healthy, healthState).catch(reportSchedulerError);
-    },
-  );
   void maybeStartInitialOrderDomainSync(initialSyncTrigger).catch(() => undefined);
+}
+
+/**
+ * MV3 service workers cannot reliably keep a setInterval alive. Use a
+ * persistent Chrome alarm for periodic health checks, while orderPollingState
+ * also performs an on-demand check before a real sync starts.
+ */
+async function ensureTtsErpHealthAlarm(): Promise<void> {
+  const state = await orderSyncStateStore.read();
+  const shouldPoll = Boolean(
+    state.settings.syncBaseUrl.trim()
+      && state.settings.syncToken.trim()
+      && state.settings.orderDomainSyncEnabled
+      && !state.settings.syncPaused,
+  );
+  if (!shouldPoll) {
+    await chrome.alarms.clear(ORDER_SYNC_ALARMS.erpHealth);
+    return;
+  }
+  const existing = await chrome.alarms.get(ORDER_SYNC_ALARMS.erpHealth);
+  if (!existing) {
+    await chrome.alarms.create(ORDER_SYNC_ALARMS.erpHealth, { periodInMinutes: 0.5 });
+  }
 }
 
 // ─── tts-erp /healthz 探活 ─────────────────────────────────────────
 
 /**
- * 探活状态变化回调。由 startHealthPolling 的 onStateChange 触发。
- * 记 runtime log，恢复时触发一轮同步。
+ * 探活状态变化回调。由 Chrome alarm 或同步前的主动探活触发。
+ * 记录 runtime log，恢复时触发一轮同步。
  */
 async function handleTtsErpHealthStateChange(
   healthy: boolean,
@@ -4525,9 +4542,17 @@ async function handleTtsErpHealthStateChange(
   }
 }
 
-/** 停止探活轮询。解绑时调用。 */
-export function stopTtsErpHealthPolling(): void {
-  stopHealthPolling();
+/** Execute one durable-alarm health check and handle state transitions. */
+export async function pollTtsErpHealth(): Promise<void> {
+  const state = await orderSyncStateStore.read();
+  const baseUrl = state.settings.syncBaseUrl.trim();
+  if (!baseUrl || !state.settings.syncToken.trim() || state.settings.syncPaused) return;
+  const before = getTtsErpHealthState().healthy;
+  await checkTtsErpHealth(baseUrl);
+  const afterState = getTtsErpHealthState();
+  if (before !== afterState.healthy) {
+    await handleTtsErpHealthStateChange(afterState.healthy, afterState);
+  }
 }
 
 
@@ -4801,12 +4826,12 @@ async function uploadOrderSyncDumpGuarded(
   return uploadOrderSyncDump(...args);
 }
 
-export async function probeSellerIdentityInBoundPage(tabId: number): Promise<{
+export async function probeSellerIdentityInBoundPage(tabId: number, sellerIdHint?: string): Promise<{
   identity: SellerIdentityResponseData;
   requestUrl: string;
   response: BoundTikTokResponse;
 }> {
-  const requestUrl = tiktokSellerIdentityEndpointUrl();
+  const requestUrl = tiktokSellerIdentityEndpointUrl(undefined, sellerIdHint);
   const response = await executeTikTokRequestWithTimeout(
     tabId,
     requestUrl,

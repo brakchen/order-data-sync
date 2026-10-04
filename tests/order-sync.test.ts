@@ -296,8 +296,35 @@ describe("fetchOrderSyncReconciliation", () => {
   it("classifies network error as NETWORK", async () => {
     const fetchImpl = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
     await expect(
-      fetchOrderSyncReconciliation(settings, scope, reconcileRequest, { fetchImpl }),
-    ).rejects.toMatchObject({ code: "NETWORK" });
+      fetchOrderSyncReconciliation(settings, scope, reconcileRequest, {
+        fetchImpl,
+        sleep: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: "NETWORK", requestDiagnostics: { attempts: 3 } });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries transient reconcile responses before falling back", async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(response({ message: "busy" }, 503))
+      .mockResolvedValueOnce(response({ message: "busy" }, 429, { "retry-after": "0" }))
+      .mockResolvedValueOnce(response({
+        code: 0,
+        requestId: "req-recovered",
+        data: { orders: {
+          serverTotal: 0,
+          anchors: [],
+          canIncremental: true,
+          offsetSafe: true,
+          ordering: { field: "order_time", direction: "desc", tieBreaker: "order_id" },
+          hotWindowSize: 40,
+        } },
+      }));
+    await expect(fetchOrderSyncReconciliation(settings, scope, reconcileRequest, {
+      fetchImpl,
+      sleep: async () => undefined,
+    })).resolves.toMatchObject({ orders: { serverTotal: 0 } });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
   it("throws PERMANENT on 403", async () => {

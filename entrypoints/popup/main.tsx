@@ -27,6 +27,7 @@ function Popup() {
   const application = useMemo(() => createPopupApplicationState({
     loadState: () => send<OrderSyncState>({ type: 'order-sync:get-state' }),
     saveSettings: (settings) => send<OrderSyncState>({ type: 'order-sync:save-settings', settings }),
+    resetEndpointCircuit: () => send<OrderSyncState>({ type: 'order-sync:reset-endpoint-circuit' }),
     syncDomains: (retryFailedOnly) => send<OrderSyncState>({ type: 'order-sync:sync-domains', retryFailedOnly }),
     stopStuckDomain: (domain) => send<OrderSyncState>({ type: 'order-sync:stop-stuck-domain', domain }),
     schedule: (task, delayMs) => window.setTimeout(task, delayMs),
@@ -114,7 +115,10 @@ function Popup() {
         {state?.endpointCircuit ? <div className="critical-alert" role="alert">
           <strong>同步已暂停：TikTok 接口持续报错</strong>
           <span>{state.endpointCircuit.endpoint} · HTTP {state.endpointCircuit.httpStatus} · 连续 {state.endpointCircuit.consecutiveFailures} 次</span>
-          <small>已停止继续请求和上传 TTS-ERP，请人工排查接口后取消暂停；配置会自动保存。</small>
+          <small>已停止继续请求和上传 TTS-ERP。确认 Seller Center 接口恢复后，可解除熔断并重试。</small>
+          <button className="secondary" disabled={busy} onClick={() => void application.resetEndpointCircuit()}>
+            解除熔断并重试
+          </button>
         </div> : null}
         <div className="next-sync"><span>下次同步</span><strong>{formatNextSync(state)}</strong></div>
         <div className="sync-actions">

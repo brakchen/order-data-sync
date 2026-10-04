@@ -13,6 +13,7 @@ export interface SellerIdentityResponseData {
 
 export function tiktokSellerIdentityEndpointUrl(
   origin = TIKTOK_SELLER_IDENTITY_API_ORIGIN,
+  sellerId?: string,
 ): string {
   const url = new URL(TIKTOK_SELLER_IDENTITY_ENDPOINT_PATH, origin);
   const params = url.searchParams;
@@ -25,6 +26,12 @@ export function tiktokSellerIdentityEndpointUrl(
   params.set('version', '3');
   params.set('need_verify_account', 'true');
   params.set('only_get_seller', '1');
+  // Match the identity hint used by Seller Center when a replacement tab is
+  // checked. The response is still parsed and verified before it is trusted.
+  if (sellerId?.trim()) {
+    params.set('oec_seller_id', sellerId.trim());
+    params.set('seller_id', sellerId.trim());
+  }
   return url.toString();
 }
 

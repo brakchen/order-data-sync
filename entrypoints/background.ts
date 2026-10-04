@@ -25,7 +25,7 @@ import {
   SELLER_TAB_ALARMS,
   SELLER_TAB_WATCH_DELAY_MINUTES,
   stopStuckOrderDomainAndRetry,
-  stopTtsErpHealthPolling,
+  pollTtsErpHealth,
 } from '../src/extension/order-engine';
 import { getTtsErpHealthState, resetHealthState } from '../src/core/tts-erp-health';
 
@@ -74,6 +74,8 @@ export default defineBackground(() => {
       void pollOrderDomain('order_details').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === ORDER_SYNC_ALARMS.order_history || alarm.name === ORDER_SYNC_ALARMS.orderHistoryContinue) {
       void pollOrderDomain('order_history').catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
+    } else if (alarm.name === ORDER_SYNC_ALARMS.erpHealth) {
+      void pollTtsErpHealth().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === SELLER_TAB_ALARMS.refresh) {
       void refreshBoundSellerTab().catch((error) => reportSchedulerError(error, { alarmName: alarm.name }));
     } else if (alarm.name === SELLER_TAB_ALARMS.watch) {
@@ -191,6 +193,16 @@ export async function handleOrderMessage(
       return bindCurrentSellerTab();
     case 'order-sync:unbind-tab':
       return unbindCurrentSellerTab();
+    case 'order-sync:reset-endpoint-circuit': {
+      resetTikTokEndpointCircuit();
+      const next = await orderSyncStateStore.update((state) => ({
+        ...state,
+        settings: { ...state.settings, syncPaused: false },
+        endpointCircuit: null,
+      }));
+      await ensureBoundAlarms('configuration_ready');
+      return next;
+    }
     case 'order-sync:sync-domains':
       await requestManualOrderDomainSync(message.retryFailedOnly === true);
       return orderSyncStateStore.read();
@@ -204,7 +216,9 @@ export async function handleOrderMessage(
 
 async function bindCurrentSellerTab(): Promise<OrderSyncState> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab?.id === undefined || !isSellerCenterUrl(tab.url)) throw new Error('请先打开 TikTok Shop Seller Center 页面。');
+  if (tab?.id === undefined || !isSellerCenterUrl(tab.url) || isTikTokLoginPage(tab.url ?? '')) {
+    throw new Error('请先打开已登录的 TikTok Shop Seller Center 页面。');
+  }
   const existing = await orderSyncStateStore.read();
   if (existing.sellerBinding.mode !== 'idle') {
     throw new Error(existing.sellerBinding.mode === 'auto' ? '自动绑定正在进行，请等待自动绑定结束或超时。' : '手动绑定正在进行，请稍候。');
@@ -219,12 +233,6 @@ async function bindCurrentSellerTab(): Promise<OrderSyncState> {
       boundTab: {
         tabId: tab.id!,
         url: tab.url!,
-        ...(current.boundTab?.sellerId ? { sellerId: current.boundTab.sellerId } : {}),
-        ...(current.boundTab?.advertiserId ? { advertiserId: current.boundTab.advertiserId } : {}),
-        ...(current.boundTab?.shopName ? { shopName: current.boundTab.shopName } : {}),
-        ...(current.boundTab?.shopCode ? { shopCode: current.boundTab.shopCode } : {}),
-        ...(current.boundTab?.shopRegion ? { shopRegion: current.boundTab.shopRegion } : {}),
-        ...(current.boundTab?.sellerRegionCode ? { sellerRegionCode: current.boundTab.sellerRegionCode } : {}),
         bindMode: 'manual',
         boundAt: new Date().toISOString(),
       },
@@ -312,12 +320,21 @@ async function captureSellerIdentity(
   const next = await orderSyncStateStore.update((current) => {
     const boundTab = current.boundTab;
     if (!boundTab || (boundTab.tabId !== senderTabId && !sameSellerCenterOrigin)) return current;
+    const {
+      sellerId: _sellerId,
+      advertiserId: _advertiserId,
+      shopName: _shopName,
+      shopCode: _shopCode,
+      shopRegion: _shopRegion,
+      sellerRegionCode: _sellerRegionCode,
+      ...withoutIdentity
+    } = boundTab;
     const sellerId = payload.sellerId.trim();
     return {
       ...current,
       sellerBinding: { mode: 'idle', outcome: 'bound', deadlineAt: null },
       boundTab: {
-        ...boundTab,
+        ...withoutIdentity,
         ...(capturedFromBoundTab ? { url: payload.url } : {}),
         sellerId,
         ...(payload.advertiserId ? { advertiserId: payload.advertiserId } : {}),
@@ -572,7 +589,7 @@ async function autoBindInitialSellerTab(candidate: chrome.tabs.Tab): Promise<voi
   await ensureBoundAlarms('configuration_ready');
 }
 
-async function probeAndCaptureSellerIdentity(candidate: chrome.tabs.Tab): Promise<boolean> {
+async function probeAndCaptureSellerIdentity(candidate: chrome.tabs.Tab, sellerIdHint?: string): Promise<boolean> {
   if (candidate.id === undefined || !candidate.url) return false;
   try {
     await recordOrderSyncRuntimeLog('all', 'seller_identity_probe_started', 'started', '已主动请求 Seller Center 店铺信息接口。', {
@@ -582,8 +599,9 @@ async function probeAndCaptureSellerIdentity(candidate: chrome.tabs.Tab): Promis
       requestType: 'GET',
       endpointPath: '/api/v3/seller/common/get',
       timeoutMs: 2_500,
+      sellerIdHintProvided: Boolean(sellerIdHint?.trim()),
     });
-    const probe = await probeSellerIdentityInBoundPage(candidate.id);
+    const probe = await probeSellerIdentityInBoundPage(candidate.id, sellerIdHint);
     const captured = await captureSellerIdentity({
       sellerId: probe.identity.sellerId,
       url: candidate.url,
@@ -770,7 +788,6 @@ async function autoRebindSellerTab(
   await orderSyncStateStore.update((current) => ({
     ...current,
     boundTab: {
-      ...previousBoundTab,
       tabId,
       url: tabUrl,
       bindMode: 'auto',
@@ -786,13 +803,23 @@ async function autoRebindSellerTab(
     pageOrigin: safeUrlOrigin(tabUrl),
     preservedProgress: true,
   });
-  await recordOrderSyncRuntimeLog('all', 'seller_auto_rebind_ready', 'succeeded', '已自动接管可用的 Seller Center 页面，不刷新当前页面，继续使用现有会话。', {
-    stage: 'seller_binding',
-    reason,
-    replacementTabId: tabId,
-    reloadRequested: false,
-    preservedSellerId: Boolean(previousBoundTab.sellerId),
-  });
+  const captured = await probeAndCaptureSellerIdentity(replacement, previousBoundTab.sellerId);
+  await recordOrderSyncRuntimeLog(
+    'all',
+    captured ? 'seller_auto_rebind_ready' : 'seller_auto_rebind_waiting_identity',
+    captured ? 'succeeded' : 'skipped',
+    captured
+      ? '已自动接管可用的 Seller Center 页面，并重新确认 Seller ID。'
+      : '已自动接管候选 Seller Center 页面，但尚未确认 Seller ID，暂不恢复同步。',
+    {
+      stage: 'seller_binding',
+      reason,
+      replacementTabId: tabId,
+      reloadRequested: false,
+      sellerIdCaptured: captured,
+      preservedProgress: true,
+    },
+  );
   await ensureBoundAlarms('configuration_ready');
 }
 

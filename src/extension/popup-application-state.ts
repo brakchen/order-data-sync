@@ -11,6 +11,7 @@ export interface PopupApplicationSnapshot {
 export interface PopupApplicationDependencies {
   loadState(): Promise<OrderSyncState>;
   saveSettings(settings: OrderSyncSettings): Promise<OrderSyncState>;
+  resetEndpointCircuit(): Promise<OrderSyncState>;
   syncDomains(retryFailedOnly: boolean): Promise<OrderSyncState>;
   stopStuckDomain(domain: OrderDomainKey): Promise<OrderSyncState>;
   schedule(task: () => void, delayMs: number): number;
@@ -84,6 +85,14 @@ export class PopupApplicationState {
       () => this.dependencies.syncDomains(retryFailedOnly),
       retryFailedOnly ? '失败项已加入同步队列。' : '订单域各接口同步已启动。',
       false,
+    );
+  }
+
+  async resetEndpointCircuit(): Promise<void> {
+    await this.#run(
+      () => this.dependencies.resetEndpointCircuit(),
+      '已解除接口熔断，可以重新同步。',
+      true,
     );
   }
 
