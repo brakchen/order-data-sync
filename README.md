@@ -1,6 +1,6 @@
 # TK订单数据同步
 
-Current version: `0.1.40`
+Current version: `0.1.41`
 
 独立 Chrome MV3 插件代码库，负责订单、物流和结算数据同步。
 

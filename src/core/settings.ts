@@ -1,6 +1,6 @@
 export const ORDER_SYNC_STATE_KEY = 'orderSyncState';
 export const ORDER_RUNTIME_LOG_LIMIT = 5_000;
-export const DEFAULT_ORDER_SYNC_BASE_URL = 'https://daqiang.nat100.top/tts';
+export const DEFAULT_ORDER_SYNC_BASE_URL = 'http://207.57.126.199:6007';
 
 import type { OrderSyncSettings } from './types';
 
@@ -17,6 +17,11 @@ export function normalizeOrderSyncBaseUrl(value: string): string {
   const trimmed = value.trim().replace(/\/+$/, '');
   try {
     const url = new URL(trimmed);
+    if (url.hostname.toLowerCase() === 'daqiang.nat100.top'
+      && url.pathname.replace(/\/+$/, '') === '/tts'
+      && (url.port === '' || url.port === '80')) {
+      return DEFAULT_ORDER_SYNC_BASE_URL;
+    }
     if (url.protocol === 'http:' && url.hostname.toLowerCase() === 'daqiang.nat100.top'
       && (url.port === '' || url.port === '80')) {
       url.protocol = 'https:';

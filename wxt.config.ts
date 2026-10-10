@@ -3,7 +3,7 @@ import { defineConfig } from 'wxt';
 export default defineConfig({
   manifest: {
     name: 'TK订单数据同步',
-    version: '0.1.40',
+    version: '0.1.41',
     description: '独立同步 TikTok Shop 订单、物流、结算与售后数据。',
     icons: {
       16: '/icons/icon-16.png',
@@ -16,8 +16,7 @@ export default defineConfig({
       'https://seller.tiktokglobalshop.com/*',
       'https://seller.tiktokshopglobalselling.com/*',
       'https://api16-normal-sg.tiktokshopglobalselling.com/*',
-      'https://daqiang.nat100.top/*',
-      'http://daqiang.nat100.top/*',
+      'http://207.57.126.199/*',
     ],
   },
   modules: ['@wxt-dev/module-react'],
