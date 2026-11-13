@@ -16,7 +16,7 @@ export default defineConfig({
       'https://seller.tiktokglobalshop.com/*',
       'https://seller.tiktokshopglobalselling.com/*',
       'https://api16-normal-sg.tiktokshopglobalselling.com/*',
-      'http://207.57.126.199/*',
+      'https://chen.daqiangplatform.com/*',
     ],
   },
   modules: ['@wxt-dev/module-react'],
